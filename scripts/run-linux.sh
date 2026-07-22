@@ -9,10 +9,17 @@ SWIFT_HOME="$HOME/.local/share/mise/installs/swift/6.3.2"
 COMPAT="$HOME/.local/share/swift-linux-compat"
 export PATH="$SWIFT_HOME/usr/bin:$PATH"
 # Arch ships wide ncurses + soname-bumped libxml2; the Ubuntu Swift toolchain
-# wants the older sonames. Bridge them (no sudo) for build + run.
+# wants the older sonames. Bridge them (no sudo) for build + run. On distros
+# whose system libs already carry the expected sonames (e.g. Ubuntu, where they
+# live under /usr/lib/<triplet>/), the Arch paths are absent and no shim is needed.
 mkdir -p "$COMPAT"
-[ -e "$COMPAT/libncurses.so.6" ] || ln -sf /usr/lib/libncursesw.so.6 "$COMPAT/libncurses.so.6"
-[ -e "$COMPAT/libxml2.so.2" ]   || ln -sf "$(ls /usr/lib/libxml2.so.* | sort -V | tail -1)" "$COMPAT/libxml2.so.2"
+if [ ! -e "$COMPAT/libncurses.so.6" ] && [ -e /usr/lib/libncursesw.so.6 ]; then
+  ln -sf /usr/lib/libncursesw.so.6 "$COMPAT/libncurses.so.6"
+fi
+xml2="$(ls /usr/lib/libxml2.so.* 2>/dev/null | sort -V | tail -1 || true)"
+if [ ! -e "$COMPAT/libxml2.so.2" ] && [ -n "$xml2" ]; then
+  ln -sf "$xml2" "$COMPAT/libxml2.so.2"
+fi
 export LD_LIBRARY_PATH="$COMPAT${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 # Point the dev build at the vendored ghostty resources (shell-integration + sibling terminfo) so

@@ -169,8 +169,9 @@ private let onShutdown: @MainActor @convention(c) (OpaquePointer?, gpointer?) ->
     if let p = gStatusColorProvider { css.withCString { gtk_css_provider_load_from_string(cast(p), $0) } }
 }
 
-/// Custom symbolic icon search paths, highest priority first. The dist tarball ships them under
-/// `<bundle>/share/icons`; dev runs can point `AGTERM_ICON_RESOURCES` at `agterm-linux/Resources/icons`,
+/// Bundled symbolic icon search paths, highest priority first. The dist tarball ships them under
+/// `<bundle>/share/icons`; the personal install copies them to `~/.local/share/agterm/icons`;
+/// dev runs can point `AGTERM_ICON_RESOURCES` at `agterm-linux/Resources/icons`,
 /// or fall back to the common repo-root / package-root working directories.
 nonisolated private func iconResourceCandidates() -> [String] {
     let env = ProcessInfo.processInfo.environment
@@ -183,15 +184,22 @@ nonisolated private func iconResourceCandidates() -> [String] {
         let bundleRoot = executable.resolvingSymlinksInPath().deletingLastPathComponent().deletingLastPathComponent()
         candidates.append(bundleRoot.appendingPathComponent("share/icons", isDirectory: true).path)
     }
+    let home = FileManager.default.homeDirectoryForCurrentUser.path
+    candidates.append("\(home)/.local/share/agterm/icons")
     let cwd = FileManager.default.currentDirectoryPath
     candidates.append((cwd as NSString).appendingPathComponent("Resources/icons"))
     candidates.append((cwd as NSString).appendingPathComponent("agterm-linux/Resources/icons"))
     return candidates
 }
 
-/// Register the custom symbolic icons (the macOS-matching toolbar glyphs: split / scratch / quick /
-/// new-workspace / new-session / flag) by adding their directory to the icon theme. Installed builds
-/// can also resolve them from the user's hicolor theme (see scripts/install-linux.sh).
+/// Register the bundled symbolic icons — the custom macOS-matching toolbar glyphs (split / scratch /
+/// quick / new-workspace / new-session / flag) plus the vendored Adwaita stock icons the UI references
+/// (Preferences page tabs, popover glyphs, …) — by adding their directory to the icon theme.
+/// The stock copies act as a hicolor fallback for desktops whose configured GTK icon theme is missing
+/// or lacks those names (common on KDE); a healthy desktop theme still takes priority.
+/// Installed builds resolve them from `~/.local/share/agterm/icons` (see scripts/install-linux.sh) or
+/// the dist bundle's `share/icons`; the custom `agterm-*` glyphs additionally land in the user's
+/// hicolor theme.
 @MainActor private func installAppIcons() {
     guard let display = gdk_display_get_default() else { return }
     let theme = gtk_icon_theme_get_for_display(display)

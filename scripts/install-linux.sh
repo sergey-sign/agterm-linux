@@ -83,6 +83,17 @@ if [ -d "agterm-linux/Resources/icons/hicolor/scalable/actions" ]; then
   echo "Installed custom symbolic toolbar icons."
 fi
 
+# The vendored Adwaita stock icons (Preferences tabs, popover glyphs, …) — copy into an app-private
+# icon dir (an installAppIcons search-path candidate), NOT the user's hicolor theme: under stock
+# freedesktop names they would otherwise leak into every GTK app's icon lookup.
+if [ -d "agterm-linux/Resources/icons/hicolor" ]; then
+  APP_ICON_BASE="$HOME/.local/share/agterm/icons"
+  rm -rf "$APP_ICON_BASE"
+  install -d "$APP_ICON_BASE"
+  cp -R agterm-linux/Resources/icons/hicolor "$APP_ICON_BASE/hicolor"
+  echo "Installed bundled fallback icons to $APP_ICON_BASE."
+fi
+
 command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$APP_DIR" || true
 
 echo "Installed agterm-linux + agtermctl to $BIN_DIR and a desktop entry to $APP_DIR."

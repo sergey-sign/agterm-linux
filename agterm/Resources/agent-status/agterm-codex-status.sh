@@ -27,7 +27,9 @@ report_status() {
 
 assistant_asked_question() {
   local message
-  if [ -x /usr/bin/plutil ]; then
+  # Guard on Darwin: /usr/bin/plutil also exists on Linux where GNUstep is installed (gnustep-base
+  # ships an incompatible tool of the same name), so its presence does not imply the macOS tool.
+  if [ "$(uname -s)" = Darwin ] && [ -x /usr/bin/plutil ]; then
     message=$(/usr/bin/plutil -extract last_assistant_message raw -o - - 2>/dev/null) || return 1
   elif command -v python3 >/dev/null 2>&1; then
     message=$(python3 -c '

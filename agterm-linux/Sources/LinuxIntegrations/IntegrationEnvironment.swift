@@ -46,13 +46,18 @@ public struct IntegrationEnvironment: Sendable {
         }
         let appImage = environment["APPIMAGE"]?.isEmpty == false
         let flatpak = environment["FLATPAK_ID"]?.isEmpty == false
+        // Inside a Flatpak sandbox the host's package installations are unreachable (/usr is the
+        // runtime's), so no system path counts as a known package tool there — probing the real
+        // filesystem would also misreport a host DEB/RPM install as available to the sandbox.
+        // AppImage keeps the probes: it runs unsandboxed and can exec host binaries.
+        let knownTools = flatpak ? [] : [
+            URL(fileURLWithPath: "/usr/bin/agtermctl"),
+            URL(fileURLWithPath: "/usr/local/bin/agtermctl"),
+            URL(fileURLWithPath: "/opt/agterm-linux/bin/agtermctl"),
+        ]
         return IntegrationEnvironment(homeDirectory: home, executableURL: executable,
                                       pathDirectories: paths, resourceRoot: override,
-                                      knownCommandLineTools: [
-                                          URL(fileURLWithPath: "/usr/bin/agtermctl"),
-                                          URL(fileURLWithPath: "/usr/local/bin/agtermctl"),
-                                          URL(fileURLWithPath: "/opt/agterm-linux/bin/agtermctl"),
-                                      ],
+                                      knownCommandLineTools: knownTools,
                                       versionOverride: environment["AGTERM_VERSION"],
                                       portableLauncherAllowed: !appImage && !flatpak)
     }

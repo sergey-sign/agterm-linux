@@ -762,6 +762,9 @@ struct IntegrationServiceTests {
             arguments: [fixture.bin.appendingPathComponent("agterm-linux").path]
         )
         #expect(!environment.portableLauncherAllowed)
+        // Empty regardless of the real filesystem: a status probe of the baked host paths would
+        // otherwise report a machine's DEB/RPM agtermctl as installed and flake this test.
+        #expect(environment.knownCommandLineTools.isEmpty)
         #expect(IntegrationService(environment: environment).status()[.commandLineTool]?.state == .unavailable)
     }
 

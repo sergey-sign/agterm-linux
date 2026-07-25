@@ -47,6 +47,52 @@ func ghosttyMods(_ state: UInt32) -> ghostty_input_mods_e {
     return ghostty_input_mods_e(rawValue: m)
 }
 
+/// Re-translates a hardware keycode through an XKB group for `latinKeyval`. Returns the group's
+/// keyval, or `nil` when the group has no translation for the keycode. Injectable so the group
+/// scan is unit-testable headless (the real implementation needs a live `GdkDisplay`).
+typealias KeyGroupTranslator = (_ keycode: UInt32, _ state: UInt32, _ group: Int32) -> UInt32?
+
+/// The production `KeyGroupTranslator`: `gdk_display_translate_key` on the default display.
+/// A nil display (headless) or a failed translation yields nil, so `latinKeyval` passes through.
+func gdkTranslateKey(keycode: UInt32, state: UInt32, group: Int32) -> UInt32? {
+    guard let display = gdk_display_get_default() else { return nil }
+    var keyval: guint = 0
+    let ok = gdk_display_translate_key(display, keycode, GdkModifierType(rawValue: state), group,
+                                       &keyval, nil, nil, nil)
+    return ok != 0 ? keyval : nil
+}
+
+/// Resolve the keyval to match app shortcuts against, independent of the active keyboard layout.
+///
+/// With a non-Latin layout active (e.g. Russian in a `us,ru` XKB setup) GDK reports the
+/// layout-translated keyval, so Ctrl+T arrives as Ctrl+`е` (Cyrillic) and matches nothing in the
+/// keymap's Latin vocabulary. When the event keyval carries no ASCII, re-translate the HARDWARE
+/// keycode through the keyboard's XKB groups (0–3) and return the first keyval that yields ASCII —
+/// the Latin layout, whichever group slot it occupies (handles both `us,ru` and `ru,us` orders).
+///
+/// Two distinct conditions, deliberately not conflated:
+/// - EARLY-OUT: `unicode < 0x80` (0 INCLUDED) — an already-ASCII keyval (letters, digits,
+///   punctuation; incl. German/AZERTY, whose ASCII differs per keycap) or a non-character keysym
+///   (Escape/arrows/F-keys → unicode 0) returns unchanged and never enters the scan. Zero overhead
+///   on Latin layouts, and the leader-abort/fallback paths never see a translated value.
+/// - SCAN-ACCEPT: `unicode != 0 && unicode < 0x80` — a group yielding no character must not win.
+///
+/// If no group yields ASCII (purely non-Latin config) or translation fails, the original keyval is
+/// returned: behavior identical to no fallback at all. Feeds ONLY shortcut matching — terminal
+/// text input flows through the separate IM/raw path with the raw keyval, so non-Latin typing
+/// reaches the shell unchanged.
+func latinKeyval(_ keyval: UInt32, keycode: UInt32, state: UInt32,
+                 translate: KeyGroupTranslator = gdkTranslateKey) -> UInt32 {
+    let unicode = gdk_keyval_to_unicode(gdk_keyval_to_lower(keyval))
+    if unicode < 0x80 { return keyval }
+    for group: Int32 in 0...3 {
+        guard let candidate = translate(keycode, state, group) else { continue }
+        let u = gdk_keyval_to_unicode(gdk_keyval_to_lower(candidate))
+        if u != 0, u < 0x80 { return candidate }
+    }
+    return keyval
+}
+
 /// Translate a GTK key press (`keyval` + `GdkModifierType state`) into the shared, host-free
 /// `agtermCore.Chord` the keymap matcher consumes — or `nil` when the press is not a bindable base key
 /// (a bare modifier, Escape, or a function/navigation key with no unicode), so the caller can run its

@@ -2,6 +2,28 @@ import CGtk
 import Foundation
 import agtermCore
 
+/// Idle-deferred second half of `dismissContextMenu`: release the ref that kept the dismissed
+/// popover's widget tree alive until the button-"clicked" emission that triggered the dismissal
+/// fully unwound. Only the finalization is deferred — the unparent itself stays synchronous, since
+/// `rebuildSidebar`'s remove-all loop cannot clear a listbox that still holds a popover child
+/// (gtk_box_remove refuses non-layout children, and the `while first_child` loop then never ends).
+private let onDeferredPopoverUnref: @MainActor @convention(c) (gpointer?) -> gboolean = { data in
+    guard let data else { return 0 }
+    g_object_unref(data)
+    return 0
+}
+
+/// Idle-deferred row context menu: when opening the menu rebuilt the sidebar (selecting a split
+/// session focuses a pane → surfaceDidFocus → rebuildSidebar), the popup waits one idle cycle so
+/// the fresh rows get laid out and mapped first.
+private let onDeferredRowContextMenu: @MainActor @convention(c) (gpointer?) -> gboolean = { data in
+    guard let data else { return 0 }
+    MainActor.assumeIsolated {
+        Unmanaged<AppController>.fromOpaque(data).takeUnretainedValue().presentPendingRowContextMenu()
+    }
+    return 0
+}
+
 @MainActor
 extension AppController {
     // MARK: - Row context menu
@@ -24,6 +46,37 @@ extension AppController {
             syncSidebarSelection()
             showActive()
         }
+        // showActive's pane focus can SYNCHRONOUSLY rebuild the sidebar (focusing a split session's
+        // pane → surfaceFocusEnter → surfaceDidFocus → rebuildSidebar), destroying the listBox and
+        // row this gesture reported — using them is a use-after-free that crashes
+        // gtk_widget_set_parent/popup. Re-resolve the session's LIVE row; and when the rebuild DID
+        // happen (the live list box differs), the fresh rows have no layout yet, so a synchronous
+        // popup anchors to a zero allocation on an unmapped parent and never appears — defer the
+        // menu one idle cycle instead (idles run after GTK's layout/map phase).
+        guard let liveRow = rowSession.first(where: { $0.value == sid })?.key,
+              let liveListBox = gtk_widget_get_parent(W(liveRow)) else { return }
+        if OpaquePointer(liveListBox) == listBox {
+            presentRowContextMenu(sid: sid, anchorX: x)
+        } else {
+            pendingContextMenuSessionID = sid
+            g_idle_add(onDeferredRowContextMenu, Unmanaged.passUnretained(self).toOpaque())
+        }
+    }
+
+    func presentPendingRowContextMenu() {
+        guard let sid = pendingContextMenuSessionID else { return }
+        pendingContextMenuSessionID = nil
+        presentRowContextMenu(sid: sid, anchorX: nil)
+    }
+
+    /// Build and pop up the row context menu for `sid`, parented to the session's CURRENT sidebar
+    /// row's list box. `anchorX` keeps the click's horizontal position when known (the synchronous
+    /// path); the deferred path passes nil and anchors near the row's leading edge.
+    private func presentRowContextMenu(sid: UUID, anchorX: Double?) {
+        guard let row = rowSession.first(where: { $0.value == sid })?.key,
+              let listBox = gtk_widget_get_parent(W(row)) else { return }
+        var rowAlloc = GtkAllocation()
+        gtk_widget_get_allocation(W(row), &rowAlloc)
         // Tear down the previous popover before storing the replacement. Popping down a newly-created,
         // not-yet-mapped GtkPopover crashes inside gtk_popover_popdown.
         dismissContextMenu()
@@ -31,8 +84,9 @@ extension AppController {
         guard let popover = op(gtk_popover_new()) else { return }
         attachControllerContext(to: popover, windowID: windowID)
         contextMenuPopover = popover
-        gtk_widget_set_parent(W(popover), W(listBox))
-        var rect = GdkRectangle(x: Int32(x), y: Int32(y), width: 1, height: 1)
+        gtk_widget_set_parent(W(popover), listBox)
+        var rect = GdkRectangle(x: Int32(anchorX ?? Double(rowAlloc.x + 24)),
+                                y: rowAlloc.y + rowAlloc.height / 2, width: 1, height: 1)
         gtk_popover_set_pointing_to(POPOVER(popover), &rect)
         gtk_popover_set_position(POPOVER(popover), GTK_POS_RIGHT)
         let box = op(gtk_box_new(GTK_ORIENTATION_VERTICAL, 0))
@@ -82,11 +136,21 @@ extension AppController {
         gtk_box_append(cast(box), W(button))
     }
 
+    /// Pop down and unparent the menu NOW, but keep its widget tree ALIVE (one extra ref, released
+    /// in an idle callback) until the current signal emission unwinds. Every menu item handler
+    /// calls this from the "clicked" emission of a button INSIDE the popover; letting the unparent
+    /// drop the last ref frees widgets that emission is still walking, which corrupts GTK's
+    /// popover/grab bookkeeping — later menus silently fail to appear and a subsequent
+    /// gtk_popover_popup crashes on freed memory. The unparent itself must stay synchronous:
+    /// the same handlers trigger a sidebar rebuild whose remove-all loop spins forever on a
+    /// listbox that still holds a popover child.
     func dismissContextMenu() {
         if let popover = contextMenuPopover {
+            contextMenuPopover = nil
+            _ = g_object_ref(RAW(popover))
             gtk_popover_popdown(POPOVER(popover))
             gtk_widget_unparent(W(popover))
-            contextMenuPopover = nil
+            g_idle_add(onDeferredPopoverUnref, RAW(popover))
         }
         contextMoveTargets.removeAll()
     }

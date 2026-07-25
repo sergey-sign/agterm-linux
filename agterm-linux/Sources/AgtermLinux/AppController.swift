@@ -134,6 +134,7 @@ final class AppController {
     var badgeEnabled = linuxSettingsStore().load().notificationBadgeEnabled ?? true   // gates the unseen-count pill
     var sessionSwitcher = SessionSwitcherModel()                                  // Ctrl-Tab hold-to-cycle state
     var contextMenuPopover: OpaquePointer?            // the live row context-menu popover
+    var pendingContextMenuSessionID: UUID?            // deferred menu target while a sidebar rebuild lays out
     var pendingWorkspaceToggle: UUID?
     var pendingWorkspaceToggleSource: guint = 0
     var sessionProgress: [UUID: Int] = [:]            // per-session OSC 9;4 progress

@@ -559,10 +559,17 @@ extension AppController {
     }
 
     func surfaceDidFocus(_ id: UUID, isSplit: Bool) {
-        guard store.session(withID: id)?.hasSplit == true else { return }
+        guard let session = store.session(withID: id), session.hasSplit else { return }
+        let paneChanged = session.splitFocused != isSplit
         store.setPaneFocus(isSplit, forSession: id)
         if let s = store.session(withID: id) { updatePaneDim(s) }
-        rebuildSidebar()
+        // Rebuild only when the focused pane actually CHANGED. A full rebuild destroys every sidebar
+        // row and list box, so an unconditional one here fires on every redundant focus report —
+        // selecting a split session refocuses its recorded pane, and that rebuild raced the row
+        // context menu (use-after-free crash in gtk_widget_set_parent/popup when it won, an
+        // instantly-dismissed menu when it lost) and broke GTK's active-state accounting for the
+        // pressed row mid-gesture.
+        if paneChanged { rebuildSidebar() }
         if id == store.selectedSessionID { updateTitle() }
     }
 

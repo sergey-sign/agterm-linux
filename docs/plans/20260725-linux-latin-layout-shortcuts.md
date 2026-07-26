@@ -121,15 +121,16 @@
 **Files:**
 - Modify: `agterm-linux/Sources/AgtermLinux/KeymapDispatch.swift`
 
-- [ ] in `handleKey`, after the Escape check, shadow `keyval` with
+- [x] in `handleKey`, after the Escape check, shadow `keyval` with
       `latinKeyval(keyval, keycode: keycode, state: state)` so `chord(fromKeyval:)`, the reserved
       chords, and `fallbackShortcut` all see the Latin keyval
-- [ ] confirm both call sites (`GhosttySurface.keyPressed`,
+- [x] confirm both call sites (`GhosttySurface.keyPressed`,
       `AppControllerCallbacks.onEmptyWindowKeyPressed`) are covered by this single hook (no other
-      `chord(fromKeyval:)` callers — grep)
-- [ ] covered by Task 1's unit tests + the manual acceptance run (the wiring line itself has no
+      `chord(fromKeyval:)` callers — grep confirmed: `handleKey` is the sole caller, both event
+      sources pass the hardware keycode through)
+- [x] covered by Task 1's unit tests + the manual acceptance run (the wiring line itself has no
       headless-observable behavior; noted per Development Approach)
-- [ ] run `swift test` in `agterm-linux/` — must pass before task 3
+- [x] run `swift test` in `agterm-linux/` — must pass before task 3 (126 tests, all passed)
 
 ### Task 3: layout-independent Ctrl+C interrupt detection
 

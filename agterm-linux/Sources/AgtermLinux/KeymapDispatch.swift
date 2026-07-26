@@ -165,6 +165,13 @@ extension AppController {
             return false
         }
 
+        // Layout-independent shortcut matching: with a non-Latin layout active the event keyval is the
+        // layout-translated character (Ctrl+T arrives as Ctrl+`е`), which matches nothing in the keymap's
+        // Latin vocabulary. Shadow it with the Latin-group re-translation so `chord(fromKeyval:)`, the
+        // reserved chords, and `fallbackShortcut` all see the Latin keyval. Shortcut matching only — a
+        // key that falls through to the terminal is encoded from the RAW event, not this value.
+        let keyval = latinKeyval(keyval, keycode: keycode, state: state)
+
         guard let chord = chord(fromKeyval: keyval, state: state) else {
             // A non-Chord key (arrow/page/F-key) can't continue a leader sequence; abandon a half-typed
             // one so a stale prefix can't complete across it (there's no Linux leader timeout yet).

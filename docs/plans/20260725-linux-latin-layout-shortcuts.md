@@ -137,27 +137,37 @@
 **Files:**
 - Modify: `agterm-linux/Sources/AgtermLinux/GhosttySurface.swift`
 
-- [ ] derive `baseScalar` in `keyPressed` from
+- [x] derive `baseScalar` in `keyPressed` from
       `latinKeyval(keyval, keycode: keycode, state: state)` so `isInterrupt` (attention-status
       clearing) recognizes Ctrl+C on a non-Latin layout
-- [ ] verify the terminal-input path below (`ke.text` / `unshifted_codepoint`) still uses the RAW
-      keyval — typing Cyrillic must be unchanged
-- [ ] covered by Task 1's unit tests + the manual acceptance run (same wiring-only rationale)
-- [ ] run `swift test` in `agterm-linux/` — must pass before task 4
+- [x] verify the terminal-input path below (`ke.text` / `unshifted_codepoint`) still uses the RAW
+      keyval — typing Cyrillic must be unchanged (it reads the raw `keyval` parameter directly;
+      only the `baseScalar` interrupt derivation was rerouted)
+- [x] covered by Task 1's unit tests + the manual acceptance run (same wiring-only rationale)
+- [x] run `swift test` in `agterm-linux/` — must pass before task 4 (126 tests, all passed)
 
 ### Task 4: Verify acceptance criteria
 
-- [ ] verify all requirements from Overview are implemented
-- [ ] full build: `cd agterm-linux && swift build` (run-linux.sh env prelude)
-- [ ] run full test suite: `swift test` in `agterm-linux/` AND `cd agtermCore && swift test`
-- [ ] run `make lint` (swiftlint strict) — zero findings
-- [ ] launch the isolated dev instance for the user's manual acceptance
-      (`AGTERM_STATE_DIR=/tmp/agterm-dev ./scripts/run-linux.sh`), then hands-off
+- [x] verify all requirements from Overview are implemented (latinKeyval group-scan fallback in
+      `GtkInterop.swift`; wired into `KeymapDispatch.handleKey` after the Escape check and into
+      `GhosttySurface.keyPressed`'s `isInterrupt`; terminal text input keeps the raw keyval —
+      commits 144fc61 / 25b6425 / b4df534)
+- [x] full build: `cd agterm-linux && swift build` (run-linux.sh env prelude) — Build complete
+- [x] run full test suite: `swift test` in `agterm-linux/` (126 tests, 17 suites, all passed) AND
+      `cd agtermCore && swift test` (1733 tests, 74 suites, all passed)
+- [x] run `make lint` (skipped - swiftlint not available on this host)
+- [x] launch the isolated dev instance for the user's manual acceptance
+      (`AGTERM_STATE_DIR=/tmp/agterm-dev ./scripts/run-linux.sh`), then hands-off — running as
+      PID 987344, socket at `/tmp/agterm-dev/agterm.sock`
 
 ### Task 5: [Final] Update documentation
 
-- [ ] no README/site/agent-skill updates needed (no new surface) — re-confirm at completion
-- [ ] move this plan to `docs/plans/completed/`
+- [x] no README/site/agent-skill updates needed (no new surface) — re-confirmed at completion:
+      `git diff linux-port...HEAD -- '*.swift'` shows only `latinKeyval` in `GtkInterop.swift`, the
+      `handleKey` keyval shadow in `KeymapDispatch.swift`, the `isInterrupt` derivation in
+      `GhosttySurface.swift`, and `LatinKeyvalTests.swift` — no new command, setting, keybinding,
+      or user-visible surface; the only non-Swift change is this plan file
+- [x] move this plan to `docs/plans/completed/` (deferred - harness moves it after review phases)
 
 ## Post-Completion
 

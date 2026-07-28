@@ -31,11 +31,12 @@ func connect(_ instance: OpaquePointer?, _ signal: String, _ handler: GCallback?
     signal.withCString { _ = g_signal_connect_data(RAW(instance), $0, handler, data, nil, GConnectFlags(rawValue: 0)) }
 }
 
-// GDK modifier bit masks (GdkModifierType).
-private let GDK_SHIFT: UInt32 = 1 << 0
-private let GDK_CONTROL: UInt32 = 1 << 2
-private let GDK_ALT: UInt32 = 1 << 3
-private let GDK_SUPER: UInt32 = 1 << 26
+// GDK modifier bit masks (GdkModifierType). Internal (not private) so tests reuse them instead of
+// mirroring the values.
+let GDK_SHIFT: UInt32 = 1 << 0
+let GDK_CONTROL: UInt32 = 1 << 2
+let GDK_ALT: UInt32 = 1 << 3
+let GDK_SUPER: UInt32 = 1 << 26
 
 /// Translate a GdkModifierType bitfield to ghostty's modifier flags.
 func ghosttyMods(_ state: UInt32) -> ghostty_input_mods_e {
@@ -60,6 +61,12 @@ func gdkTranslateKey(keycode: UInt32, state: UInt32, group: Int32) -> UInt32? {
     let ok = gdk_display_translate_key(display, keycode, GdkModifierType(rawValue: state), group,
                                        &keyval, nil, nil, nil)
     return ok != 0 ? keyval : nil
+}
+
+/// The lowered unicode character of a keyval (0 for a non-character keysym) — the shared
+/// composition behind the Latin early-out, the group-scan accept, the Ctrl+C check, and `chord`.
+@inline(__always) private func loweredUnicode(_ keyval: UInt32) -> guint32 {
+    gdk_keyval_to_unicode(gdk_keyval_to_lower(keyval))
 }
 
 /// Latin-script unicode blocks beyond ASCII: Latin-1 Supplement through Latin Extended-B
@@ -99,13 +106,13 @@ private func isLatinScriptUnicode(_ unicode: guint32) -> Bool {
 /// such shifted/punctuation chords stay layout-dependent; and a binding deliberately using a
 /// non-Latin letter (`map ctrl+ж`) cannot fire while a Latin group is configured, because the scan
 /// rewrites the keyval before the matcher sees it.
-func latinKeyval(_ keyval: UInt32, keycode: UInt32, state: UInt32,
+func latinKeyval(keyval: UInt32, keycode: UInt32, state: UInt32,
                  translate: KeyGroupTranslator = gdkTranslateKey) -> UInt32 {
-    let unicode = gdk_keyval_to_unicode(gdk_keyval_to_lower(keyval))
+    let unicode = loweredUnicode(keyval)
     if unicode < 0x80 || isLatinScriptUnicode(unicode) { return keyval }
     for group: Int32 in 0...3 {
         guard let candidate = translate(keycode, state, group) else { continue }
-        let u = gdk_keyval_to_unicode(gdk_keyval_to_lower(candidate))
+        let u = loweredUnicode(candidate)
         if u != 0, u < 0x80 { return candidate }
     }
     return keyval
@@ -119,8 +126,8 @@ func isInterruptKey(keyval: UInt32, keycode: UInt32, state: UInt32,
                     translate: KeyGroupTranslator = gdkTranslateKey) -> Bool {
     if keyval == 0xFF1B { return true }
     guard state & GDK_CONTROL != 0, state & (GDK_SHIFT | GDK_ALT | GDK_SUPER) == 0 else { return false }
-    let base = latinKeyval(keyval, keycode: keycode, state: state, translate: translate)
-    return gdk_keyval_to_unicode(gdk_keyval_to_lower(base)) == 0x63
+    let base = latinKeyval(keyval: keyval, keycode: keycode, state: state, translate: translate)
+    return loweredUnicode(base) == 0x63
 }
 
 /// Translate a GTK key press (`keyval` + `GdkModifierType state`) into the shared, host-free
@@ -163,7 +170,7 @@ func chord(fromKeyval keyval: UInt32, state: UInt32) -> Chord? {
     } else {
         unshiftedKeyval = keyval
     }
-    let u = gdk_keyval_to_unicode(gdk_keyval_to_lower(unshiftedKeyval))
+    let u = loweredUnicode(unshiftedKeyval)
     guard u >= 0x20, u != 0x7F, let scalar = Unicode.Scalar(u) else { return nil }
     let key = String(scalar).lowercased()
     guard key.count == 1, key != " " else { return nil }

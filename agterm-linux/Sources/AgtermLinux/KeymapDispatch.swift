@@ -110,7 +110,7 @@ enum ShortcutKeyResolution: Equatable {
 /// through to the terminal is encoded from the RAW event, never from this value.
 func resolveShortcutKey(keyval: UInt32, keycode: UInt32, state: UInt32,
                         translate: KeyGroupTranslator = gdkTranslateKey) -> ShortcutKeyResolution {
-    let matchKeyval = latinKeyval(keyval, keycode: keycode, state: state, translate: translate)
+    let matchKeyval = latinKeyval(keyval: keyval, keycode: keycode, state: state, translate: translate)
     if let chord = chord(fromKeyval: matchKeyval, state: state) {
         return .chord(chord, matchKeyval: matchKeyval)
     }
@@ -196,7 +196,7 @@ extension AppController {
         switch resolveShortcutKey(keyval: keyval, keycode: keycode, state: state) {
         case .fallback(let matchKeyval):
             // A non-Chord key (arrow/page/F-key) can't continue a leader sequence; abandon a half-typed
-            // one so a stale prefix can't complete across it (there's no Linux leader timeout yet).
+            // one so a stale prefix can't complete across it.
             if customCommandEngine.isArmed { customCommandEngine.reset() }
             return fallbackShortcut(keyval: matchKeyval, state: state, sessionID: sessionID, origin: origin)
 
@@ -225,7 +225,8 @@ extension AppController {
                 return true
             }
 
-            // Expressible but unbound (e.g. the font keys): the fixed fallback.
+            // Expressible but unbound (e.g. the font keys): the fixed fallback. `origin` is not
+            // forwarded here (pre-existing behavior): the font keys act on the focused surface.
             return fallbackShortcut(keyval: matchKeyval, state: state, sessionID: sessionID)
         }
     }

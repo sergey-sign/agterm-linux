@@ -54,6 +54,11 @@ Linux uses desktop conventions: key labels are Ctrl/Shift rather than Command/Op
 provided by libadwaita, and local `file://` links open their containing folder in the default file manager.
 Its desktop, notification, and Flatpak application ID is `io.github.melonamin.agterm`, owned by this Linux fork.
 Ctrl+Shift+M toggles the most-recently-used dashboard because Ctrl+Shift+D remains the split shortcut.
+App shortcuts match layout-independently: with a non-Latin layout active (Russian, Greek, and so on), a key
+that yields no Latin character is matched by its Latin XKB group character, so `keymap.conf` chords like
+`ctrl+t` fire whatever the active layout prints, while terminal typing keeps the layout's own text; a chord
+deliberately bound to a non-Latin letter therefore cannot fire while a Latin group is configured (see the
+non-Latin layout section of `docs/troubleshooting.md` for details and limits).
 The content header exposes the same dashboard toggle as a grid button, grouped beside Quick Terminal.
 Dashboard and terminal-zoom views use stripped native headers: `Dashboard` or the active session title is
 shown with a custom window name when one exists, beside the matching exit button.

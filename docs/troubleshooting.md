@@ -173,6 +173,8 @@ keybind = super+v=paste_from_clipboard
 
 Reload with **File ▸ Reload Config** or `agtermctl config reload`. The keybind syntax is at <https://ghostty.org/docs/config/keybind/reference>.
 
+On Linux, agterm's own shortcuts — the `keymap.conf` built-ins and custom-command chords, the reserved Ctrl+Tab and Ctrl+1/2, and the Ctrl+C attention-clear — are layout-independent: when the active layout produces no Latin character for a key, agterm re-translates the hardware key through the keyboard's Latin XKB group, so Ctrl+T fires under a Russian (or any other non-Latin) layout without remapping. Terminal typing is unaffected — non-Latin text reaches the shell unchanged — and a keyboard configured with no Latin group at all keeps the layout's own characters for matching. Two limits: a key whose non-Latin layout already prints a *different* Latin character than the Latin layout does (on Russian, Shift+2 prints `"`) still matches by the printed character, and a chord deliberately bound to a non-Latin letter (`map ctrl+ж`) cannot fire while a Latin group is configured, because matching uses the Latin re-translation.
+
 ## Other common issues
 
 - **`agtermctl: command not found`.** Install it from Help ▸ Install Command Line Tool… (it symlinks into `/usr/local/bin`). You can also call it by its full path inside the app bundle: `agterm.app/Contents/MacOS/agtermctl`.

@@ -62,35 +62,65 @@ func gdkTranslateKey(keycode: UInt32, state: UInt32, group: Int32) -> UInt32? {
     return ok != 0 ? keyval : nil
 }
 
+/// Latin-script unicode blocks beyond ASCII: Latin-1 Supplement through Latin Extended-B
+/// (0xA0–0x24F — German/French/Spanish/Nordic/Czech/Polish/Turkish accented letters, plus Latin-1
+/// symbol keycaps like AZERTY `²`/`§`) and Latin Extended Additional (0x1E00–0x1EFF, Vietnamese).
+/// A keyval in these ranges comes from a Latin layout and must NOT be re-routed by the group scan.
+private func isLatinScriptUnicode(_ unicode: guint32) -> Bool {
+    (0xA0...0x24F).contains(unicode) || (0x1E00...0x1EFF).contains(unicode)
+}
+
 /// Resolve the keyval to match app shortcuts against, independent of the active keyboard layout.
 ///
 /// With a non-Latin layout active (e.g. Russian in a `us,ru` XKB setup) GDK reports the
 /// layout-translated keyval, so Ctrl+T arrives as Ctrl+`е` (Cyrillic) and matches nothing in the
-/// keymap's Latin vocabulary. When the event keyval carries no ASCII, re-translate the HARDWARE
-/// keycode through the keyboard's XKB groups (0–3) and return the first keyval that yields ASCII —
-/// the Latin layout, whichever group slot it occupies (handles both `us,ru` and `ru,us` orders).
+/// keymap's Latin vocabulary. When the event keyval carries no Latin character, re-translate the
+/// HARDWARE keycode through the keyboard's XKB groups (0–3) and return the first keyval that
+/// yields ASCII — the Latin layout, whichever group slot it occupies (handles both `us,ru` and
+/// `ru,us` orders).
 ///
 /// Two distinct conditions, deliberately not conflated:
-/// - EARLY-OUT: `unicode < 0x80` (0 INCLUDED) — an already-ASCII keyval (letters, digits,
-///   punctuation; incl. German/AZERTY, whose ASCII differs per keycap) or a non-character keysym
-///   (Escape/arrows/F-keys → unicode 0) returns unchanged and never enters the scan. Zero overhead
-///   on Latin layouts, and the leader-abort/fallback paths never see a translated value.
+/// - EARLY-OUT: the lowered unicode is ASCII (`< 0x80`, 0 INCLUDED, so non-character keysyms —
+///   Escape/arrows/F-keys — return unchanged and never enter the scan) or a Latin-script character
+///   (`isLatinScriptUnicode`). A Latin-layout keyval is always taken as-is, so an accented-letter
+///   binding (`map ctrl+ü`) keeps matching and an AZERTY digit-row key (Ctrl+é) is never re-routed
+///   onto the reserved Ctrl+2 chord. Zero overhead on Latin layouts, and the leader-abort/fallback
+///   paths never see a translated value.
 /// - SCAN-ACCEPT: `unicode != 0 && unicode < 0x80` — a group yielding no character must not win.
 ///
 /// If no group yields ASCII (purely non-Latin config) or translation fails, the original keyval is
 /// returned: behavior identical to no fallback at all. Feeds ONLY shortcut matching — terminal
 /// text input flows through the separate IM/raw path with the raw keyval, so non-Latin typing
 /// reaches the shell unchanged.
+///
+/// Known limits of this keyval-first matching (GTK-standard; upstream ghostty behaves the same):
+/// a non-Latin key whose keyval is ALREADY a different ASCII character than the Latin group's
+/// (Russian Shift+2 prints `"`, the Russian `/?` key prints `.`) early-outs on that character, so
+/// such shifted/punctuation chords stay layout-dependent; and a binding deliberately using a
+/// non-Latin letter (`map ctrl+ж`) cannot fire while a Latin group is configured, because the scan
+/// rewrites the keyval before the matcher sees it.
 func latinKeyval(_ keyval: UInt32, keycode: UInt32, state: UInt32,
                  translate: KeyGroupTranslator = gdkTranslateKey) -> UInt32 {
     let unicode = gdk_keyval_to_unicode(gdk_keyval_to_lower(keyval))
-    if unicode < 0x80 { return keyval }
+    if unicode < 0x80 || isLatinScriptUnicode(unicode) { return keyval }
     for group: Int32 in 0...3 {
         guard let candidate = translate(keycode, state, group) else { continue }
         let u = gdk_keyval_to_unicode(gdk_keyval_to_lower(candidate))
         if u != 0, u < 0x80 { return candidate }
     }
     return keyval
+}
+
+/// Whether a key press counts as an interrupt for attention-status clearing: Escape, or Ctrl+C
+/// with no other modifier held. The `c` is resolved through `latinKeyval` so Ctrl+C is recognized
+/// on a non-Latin layout, and the modifier guard runs FIRST so plain typing never pays the group
+/// scan. Translator-injectable so the predicate is headless-testable (mirrors `latinKeyval`).
+func isInterruptKey(keyval: UInt32, keycode: UInt32, state: UInt32,
+                    translate: KeyGroupTranslator = gdkTranslateKey) -> Bool {
+    if keyval == 0xFF1B { return true }
+    guard state & GDK_CONTROL != 0, state & (GDK_SHIFT | GDK_ALT | GDK_SUPER) == 0 else { return false }
+    let base = latinKeyval(keyval, keycode: keycode, state: state, translate: translate)
+    return gdk_keyval_to_unicode(gdk_keyval_to_lower(base)) == 0x63
 }
 
 /// Translate a GTK key press (`keyval` + `GdkModifierType state`) into the shared, host-free

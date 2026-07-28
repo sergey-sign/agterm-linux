@@ -90,6 +90,9 @@
 - The early-out keeps the leader-abort and fallback paths from ever seeing a translated value, and
   means Latin layouts (incl. German/AZERTY, whose ASCII differs per keycap) are always taken
   as-is — only genuinely non-Latin keyvals fall back to a Latin group.
+  (Review amendment: the early-out also accepts Latin-script keyvals beyond ASCII — Latin-1 through
+  Latin Extended-B plus Latin Extended Additional — so accented keycaps like `ü`/`é`/`č` are taken
+  as-is too, keeping `map ctrl+é` bindings working and AZERTY's Ctrl+é off the reserved Ctrl+2.)
 - Digits are unshifted on both us and ru layouts, so the reserved Ctrl+1/2 chords and the digit
   fallback are unaffected either way.
 
@@ -155,7 +158,9 @@
 - [x] full build: `cd agterm-linux && swift build` (run-linux.sh env prelude) — Build complete
 - [x] run full test suite: `swift test` in `agterm-linux/` (126 tests, 17 suites, all passed) AND
       `cd agtermCore && swift test` (1733 tests, 74 suites, all passed)
-- [x] run `make lint` (skipped - swiftlint not available on this host)
+- [x] run `make lint` (passed locally with pinned swiftlint 0.65.0 + swiftly 6.3.2 sourcekit;
+      only finding is the pre-existing AppController.swift file_length 1001 on the base branch,
+      out of scope for this PR)
 - [x] launch the isolated dev instance for the user's manual acceptance
       (`AGTERM_STATE_DIR=/tmp/agterm-dev ./scripts/run-linux.sh`), then hands-off — running as
       PID 987344, socket at `/tmp/agterm-dev/agterm.sock`

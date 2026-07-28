@@ -92,6 +92,31 @@ func loadLinuxKeymap(configDirectory: URL) -> (keymap: Keymap, diagnostics: [Key
     return (Keymap(builtinOverrides: overrides, commands: commands), diagnostics)
 }
 
+/// The pure routing decision `handleKey` makes for a (non-Escape) key press.
+enum ShortcutKeyResolution: Equatable {
+    /// Chord-expressible: match custom commands / built-ins. `matchKeyval` is the Latin-group
+    /// keyval, kept for the fixed fallback when the chord is reserved or unbound.
+    case chord(Chord, matchKeyval: UInt32)
+    /// Not Chord-expressible (arrow/page/F-key): the keyval for the fixed fallback.
+    case fallback(matchKeyval: UInt32)
+}
+
+/// Layout-independent shortcut matching: with a non-Latin layout active the event keyval is the
+/// layout-translated character (Ctrl+T arrives as Ctrl+`е`), which matches nothing in the keymap's
+/// Latin vocabulary. Re-translate through the Latin XKB group (`latinKeyval`), then fold to the
+/// shared `Chord` vocabulary. Free-standing and translator-injectable so the load-bearing wiring —
+/// a non-Latin keyval resolving to its Latin-group chord — is pinned by headless tests
+/// (`handleKey` itself needs a live GTK controller). Shortcut matching only — a key that falls
+/// through to the terminal is encoded from the RAW event, never from this value.
+func resolveShortcutKey(keyval: UInt32, keycode: UInt32, state: UInt32,
+                        translate: KeyGroupTranslator = gdkTranslateKey) -> ShortcutKeyResolution {
+    let matchKeyval = latinKeyval(keyval, keycode: keycode, state: state, translate: translate)
+    if let chord = chord(fromKeyval: matchKeyval, state: state) {
+        return .chord(chord, matchKeyval: matchKeyval)
+    }
+    return .fallback(matchKeyval: matchKeyval)
+}
+
 @MainActor
 private final class LeaderTimeoutContext {
     weak var controller: AppController?
@@ -165,46 +190,44 @@ extension AppController {
             return false
         }
 
-        // Layout-independent shortcut matching: with a non-Latin layout active the event keyval is the
-        // layout-translated character (Ctrl+T arrives as Ctrl+`е`), which matches nothing in the keymap's
-        // Latin vocabulary. Shadow it with the Latin-group re-translation so `chord(fromKeyval:)`, the
-        // reserved chords, and `fallbackShortcut` all see the Latin keyval. Shortcut matching only — a
-        // key that falls through to the terminal is encoded from the RAW event, not this value.
-        let keyval = latinKeyval(keyval, keycode: keycode, state: state)
-
-        guard let chord = chord(fromKeyval: keyval, state: state) else {
+        // Layout-independent chord derivation lives in resolveShortcutKey (translator-injectable,
+        // headless-tested); `chord(fromKeyval:)`, the reserved chords, and `fallbackShortcut` all see
+        // the Latin-group keyval it carries.
+        switch resolveShortcutKey(keyval: keyval, keycode: keycode, state: state) {
+        case .fallback(let matchKeyval):
             // A non-Chord key (arrow/page/F-key) can't continue a leader sequence; abandon a half-typed
             // one so a stale prefix can't complete across it (there's no Linux leader timeout yet).
             if customCommandEngine.isArmed { customCommandEngine.reset() }
-            return fallbackShortcut(keyval: keyval, state: state, sessionID: sessionID, origin: origin)
-        }
+            return fallbackShortcut(keyval: matchKeyval, state: state, sessionID: sessionID, origin: origin)
 
-        // Reserved monitor chords (Ctrl+Tab, Ctrl+1/2) are never rebindable — they also can't be part of a
-        // custom keybind, so abandon any armed leader and go straight to the fallback.
-        if isLinuxReservedChord(chord) {
-            if customCommandEngine.isArmed { customCommandEngine.reset() }
-            return fallbackShortcut(keyval: keyval, state: state, sessionID: sessionID, origin: origin)
-        }
+        case .chord(let chord, let matchKeyval):
+            // Reserved monitor chords (Ctrl+Tab, Ctrl+1/2) are never rebindable — they also can't be part
+            // of a custom keybind, so abandon any armed leader and go straight to the fallback.
+            if isLinuxReservedChord(chord) {
+                if customCommandEngine.isArmed { customCommandEngine.reset() }
+                return fallbackShortcut(keyval: matchKeyval, state: state, sessionID: sessionID, origin: origin)
+            }
 
-        // Custom-command leader matcher (disjoint from built-ins by parseKeymap validation).
-        switch customCommandEngine.advance(chord) {
-        case .fired(let cmd):
-            runCustomCommand(cmd, origin: origin, allowSessionless: store.activeSession == nil)
-            return true
-        case .armed:
-            return true   // leader in progress: consume and wait for the next chord
-        case .unmatched:
-            break
-        }
+            // Custom-command leader matcher (disjoint from built-ins by parseKeymap validation).
+            switch customCommandEngine.advance(chord) {
+            case .fired(let cmd):
+                runCustomCommand(cmd, origin: origin, allowSessionless: store.activeSession == nil)
+                return true
+            case .armed:
+                return true   // leader in progress: consume and wait for the next chord
+            case .unmatched:
+                break
+            }
 
-        // Built-in (user override or Linux default).
-        if let action = resolvedBuiltinChords[chord] {
-            dispatchBuiltin(action, sessionID: sessionID)
-            return true
-        }
+            // Built-in (user override or Linux default).
+            if let action = resolvedBuiltinChords[chord] {
+                dispatchBuiltin(action, sessionID: sessionID)
+                return true
+            }
 
-        // Expressible but unbound (e.g. the font keys): the fixed fallback.
-        return fallbackShortcut(keyval: keyval, state: state, sessionID: sessionID)
+            // Expressible but unbound (e.g. the font keys): the fixed fallback.
+            return fallbackShortcut(keyval: matchKeyval, state: state, sessionID: sessionID)
+        }
     }
 
     /// Abandon a half-typed leader sequence (called on terminal focus loss — mirrors the macOS

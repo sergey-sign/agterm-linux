@@ -532,15 +532,12 @@ final class GhosttySurface: TerminalSurface {
         guard let surface else { return false }
         controller?.noteUserActivity()
 
-        let control = (state & (1 << 2)) != 0
-        let hasOtherModifiers = (state & ((1 << 0) | (1 << 3) | (1 << 26))) != 0
-        // Latin-group re-translation so Ctrl+C is recognized on a non-Latin layout (matching
-        // KeymapDispatch.handleKey); ONLY interrupt detection uses it — the terminal-input path
-        // below keeps the raw keyval so typing Cyrillic is unchanged.
-        let baseScalar = Unicode.Scalar(
-            gdk_keyval_to_unicode(gdk_keyval_to_lower(latinKeyval(keyval, keycode: keycode, state: state))))
-        let isInterrupt = keyval == 0xFF1B || (control && !hasOtherModifiers && baseScalar?.value == 0x63)
+        // Escape or sole-Ctrl+C clears the pane's attention status; isInterruptKey resolves the `c`
+        // through the Latin-group fallback (matching KeymapDispatch) and only for sole-Ctrl presses,
+        // so plain typing never pays the group scan — and the terminal-input path below keeps the
+        // raw keyval so typing Cyrillic is unchanged.
         if let pane = role.statusPane {
+            let isInterrupt = isInterruptKey(keyval: keyval, keycode: keycode, state: state)
             controller?.clearAttentionStatus(sessionID, pane: pane, isInterrupt: isInterrupt)
         }
 

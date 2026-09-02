@@ -620,10 +620,23 @@ final class GhosttySurface: TerminalSurface {
         guard let surface else { return false }
         controller?.noteUserActivity()
 
+        // One keymap scan per press at most, shared by the three consumers below. Memoized rather than
+        // recomputed: `gdk_display_map_keycode` runs over the whole ANSI row to classify the layout.
+        var scannedKeyContext: ShortcutKeyContext??
+        func keyContext() -> ShortcutKeyContext? {
+            if let scanned = scannedKeyContext { return scanned }
+            let scanned = shortcutKeyContext(event: event, keycode: keycode)
+            scannedKeyContext = scanned
+            return scanned
+        }
+
         let control = (state & (1 << 2)) != 0
         let hasOtherModifiers = (state & ((1 << 0) | (1 << 3) | (1 << 26))) != 0
-        let baseScalar = Unicode.Scalar(gdk_keyval_to_unicode(gdk_keyval_to_lower(keyval)))
-        let isInterrupt = keyval == 0xFF1B || (control && !hasOtherModifiers && baseScalar?.value == 0x63)
+        // Sole-Ctrl+C, resolved the way a shortcut is: on a layout that cannot type Latin, Ctrl+C arrives
+        // as Ctrl+`с` (Cyrillic) and the raw keyval never matches. The modifier guard short-circuits
+        // first, so ordinary typing never triggers the scan.
+        let isInterrupt = keyval == 0xFF1B || (control && !hasOtherModifiers && layoutIndependentKey(
+            keyval: keyval, keycode: keycode, shifted: false, context: keyContext) == "c")
         if let pane = role.statusPane {
             controller?.clearAttentionStatus(sessionID, pane: pane, isInterrupt: isInterrupt)
         }
@@ -633,7 +646,7 @@ final class GhosttySurface: TerminalSurface {
         // this handler stays thin; ghostty still gets its own binds (Ctrl+Shift+C/V) when handleKey passes.
         if controller?.handleKey(keyval: keyval, keycode: keycode, state: state,
                                  sessionID: sessionID, origin: self,
-                                 context: shortcutKeyContext(event: event, keycode: keycode)) == true {
+                                 context: keyContext()) == true {
             return true
         }
 
@@ -666,7 +679,17 @@ final class GhosttySurface: TerminalSurface {
                 return ghostty_surface_key(surface, ke)
             }
         } else {
-            ke.unshifted_codepoint = unicode >= 0x20 ? unicode : 0
+            // libghostty matches its OWN binds (Ctrl+Shift+C/V) against this codepoint, so the
+            // layout-independent resolution applies here too — a Russian layout's Ctrl+Shift+`С` must
+            // present as `c` or the clipboard binds never fire. Only the modifier branch is rewritten;
+            // the text branch above keeps the raw keyval, so typing is untouched. A key with no
+            // layout-independent form (arrows, F-keys) falls back to the raw codepoint.
+            let layoutKey = hasCtrlAltSuper
+                ? layoutIndependentKey(keyval: keyval, keycode: keycode,
+                                       shifted: state & (1 << 0) != 0, context: keyContext)
+                : nil
+            let base = layoutKey?.unicodeScalars.first?.value
+            ke.unshifted_codepoint = base ?? (unicode >= 0x20 ? unicode : 0)
             ke.text = nil
             return ghostty_surface_key(surface, ke)
         }

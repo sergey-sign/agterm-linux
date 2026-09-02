@@ -217,4 +217,68 @@ struct LayoutIndependentShortcutTests {
             ]
         })
     }
+
+    // MARK: - The two consumers outside the keymap matcher
+
+    @Test("Ctrl+C on a Russian layout resolves to the interrupt key")
+    func russianControlCResolvesToInterrupt() {
+        let mapping = context(group: 1, isASCIICapable: false, entries: [
+            .init(group: 0, level: 0, keyval: keyval("c")),
+            .init(group: 1, level: 0, keyval: keyval("с")),   // Cyrillic es
+        ])
+
+        #expect(layoutIndependentKey(
+            keyval: keyval("с"), keycode: 54, shifted: false, context: { mapping }) == "c")
+    }
+
+    @Test("An ASCII-capable layout keeps its own character for the interrupt check")
+    func asciiLayoutKeepsProducedInterruptKey() {
+        // `entries` belong to the ONE keycode being resolved, so each assertion carries its own.
+        func ascii(_ scalar: Unicode.Scalar) -> ShortcutKeyContext {
+            context(isASCIICapable: true, entries: [.init(group: 0, level: 0, keyval: keyval(scalar))])
+        }
+
+        #expect(layoutIndependentKey(
+            keyval: keyval("c"), keycode: 54, shifted: false, context: { ascii("c") }) == "c")
+        // Dvorak's `j` sits on the ANSI `c` position: an ASCII-capable layout must keep the produced
+        // letter rather than the physical one.
+        #expect(layoutIndependentKey(
+            keyval: keyval("j"), keycode: 54, shifted: false, context: { ascii("j") }) == "j")
+    }
+
+    @Test("Ctrl+Shift+V on a Russian layout resolves to ghostty's paste codepoint")
+    func russianControlShiftVResolvesForGhosttyBinds() throws {
+        let mapping = context(group: 1, isASCIICapable: false, entries: [
+            .init(group: 0, level: 0, keyval: keyval("v")),
+            .init(group: 1, level: 0, keyval: keyval("м")),   // Cyrillic em
+        ])
+
+        let key = try #require(layoutIndependentKey(
+            keyval: keyval("М"), keycode: 55, shifted: true, context: { mapping }))
+
+        #expect(key.unicodeScalars.first?.value == Unicode.Scalar("v").value)
+    }
+
+    @Test("A key with no layout-independent form yields nil so the caller keeps the raw codepoint")
+    func nonCharacterKeyHasNoLayoutIndependentForm() {
+        let mapping = context(isASCIICapable: false, entries: [])
+
+        #expect(layoutIndependentKey(          // Left arrow
+            keyval: 0xFF51, keycode: 113, shifted: false, context: { mapping }) == nil)
+    }
+
+    @Test("The keymap scan is skipped for a press that cannot be a shortcut")
+    func nonShortcutPressSkipsTheKeymapScan() {
+        var scans = 0
+        let scan: () -> ShortcutKeyContext? = {
+            scans += 1
+            return self.context(isASCIICapable: false, entries: [])
+        }
+
+        _ = layoutIndependentKey(keyval: 0xFF51, keycode: 113, shifted: false, context: scan)
+        #expect(scans == 0)
+
+        _ = layoutIndependentKey(keyval: keyval("с"), keycode: 54, shifted: false, context: scan)
+        #expect(scans == 1)
+    }
 }

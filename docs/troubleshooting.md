@@ -185,6 +185,8 @@ ASCII-capable layouts remain semantic, so alternative Latin layouts and their sh
 Layouts that cannot type the complete ASCII alphabet resolve every shortcut key by its physical ANSI position.
 This keeps shortcuts such as Ctrl+Shift+J working after an English-to-Russian switch and also covers Greek or Hebrew positions that produce ASCII punctuation instead of letters.
 Ctrl+Shift+Tab reverses the active Ctrl-Tab session cycle; Ctrl+Tab with additional modifiers remains reserved for that switcher.
+The same resolution reaches two keys that are not keymap shortcuts: the Ctrl+C that clears a pane's attention status, and the unshifted codepoint ghostty matches its own binds against, so Ctrl+Shift+C/V still copy and paste after a switch to a non-Latin layout.
+Terminal typing is untouched — the text a key produces reaches the shell exactly as the layout prints it.
 
 ⌘C and ⌘V copy and paste on any keyboard layout, non-Latin ones (Russian, Greek, and so on) included, because agterm binds them to the physical key positions rather than to the character a layout prints. The physical C and V keys then work no matter what those keys produce in the active layout.
 

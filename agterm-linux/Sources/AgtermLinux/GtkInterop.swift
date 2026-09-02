@@ -215,19 +215,37 @@ func shortcutChord(
     }
     if keyval == 0xFF1B { return nil }
 
-    let legacyKeyval = legacyBaseKeyval(keyval, shifted: mods.contains(.shift))
+    guard let key = layoutIndependentKey(
+        keyval: keyval, keycode: keycode, shifted: mods.contains(.shift), context: context
+    ) else { return nil }
+    return Chord(mods: mods, key: key)
+}
+
+/// The layout-independent base key of a press — the same resolution `shortcutChord` applies, minus the
+/// named keys and the modifier set. Split out because two consumers OUTSIDE the keymap matcher must agree
+/// with it key-for-key or they go layout-dependent on their own: the Ctrl+C attention-clear, and the
+/// unshifted codepoint libghostty matches its OWN binds (Ctrl+Shift+C/V) against.
+///
+/// `context` stays a closure rather than a value so the caller's `gdk_display_map_keycode` scan is skipped
+/// for a press that can't be a shortcut anyway — the legacy-keyval guard runs first, exactly as it did
+/// when this was inline.
+func layoutIndependentKey(
+    keyval: UInt32,
+    keycode: UInt32,
+    shifted: Bool,
+    context: () -> ShortcutKeyContext?
+) -> String? {
+    let legacyKeyval = legacyBaseKeyval(keyval, shifted: shifted)
     guard shortcutKeyString(for: legacyKeyval) != nil else { return nil }
     let keyContext = context()
     let producedKeyval = keyContext.flatMap {
         uniqueBaseKeyval(in: $0.activeGroup, entries: $0.entries)
     } ?? legacyKeyval
-    let produced = shortcutKeyString(for: producedKeyval)
-    guard let key = linuxShortcutKey(
+    return linuxShortcutKey(
         keycode: keycode,
-        produced: produced,
+        produced: shortcutKeyString(for: producedKeyval),
         layoutIsASCIICapable: keyContext?.layoutIsASCIICapable ?? true
-    ) else { return nil }
-    return Chord(mods: mods, key: key)
+    )
 }
 
 private func shortcutModifiers(_ state: UInt32) -> Modifier {

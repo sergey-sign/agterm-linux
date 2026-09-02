@@ -63,6 +63,7 @@ extension AppController {
         searchSurface?.endSearch()
         if sessionSwitcher.isActive { endSessionSwitch() }
         dashboard.open(members: members, fontMode: fontMode)
+        refreshPaneOverlayCoverage()
         suppressAutoFollow()
         showDashboardSourcePages()
         showActive(focus: false)
@@ -89,11 +90,17 @@ extension AppController {
         dashboardRuntime.statusIcons = [:]
         dashboardRuntime.clickContexts = []
         dashboard.close()
+        refreshPaneOverlayCoverage()
         resumeAutoFollow()
         restoreSessionTopPages()
         gtk_widget_set_can_target(W(splitView), 1)
-        showActive()
-        if refocus { focusedSurface()?.grabFocus() }
+        // The overlay removal above destroyed the host `mountDashboard` grabbed, so both legs must hand
+        // the keyboard back.
+        if refocus {
+            showActiveFocusingVisibleSurface()
+        } else {
+            showActive()
+        }
     }
 
     func selectDashboardMember(_ member: DashboardMember) {
@@ -125,9 +132,7 @@ extension AppController {
         guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory), isDirectory.boolValue else {
             return false
         }
-        URL(fileURLWithPath: path).absoluteString.withCString {
-            _ = g_app_info_launch_default_for_uri($0, nil, nil)
-        }
+        launchDefaultHandler(forURI: URL(fileURLWithPath: path).absoluteString)
         return true
     }
 
@@ -174,6 +179,7 @@ extension AppController {
         adw_header_bar_set_title_widget(header, W(titleLabel))
         let exit = OpaquePointer(gtk_button_new_with_label("Exit Dashboard"))
         gtk_widget_set_tooltip_text(W(exit), "Exit Dashboard")
+        gtk_widget_set_focus_on_click(W(exit), 0)
         connect(exit, "clicked", unsafeBitCast(onDashboardExit, to: GCallback.self))
         adw_header_bar_pack_end(header, W(exit))
         adw_toolbar_view_add_top_bar(host, W(header))
@@ -199,7 +205,7 @@ extension AppController {
             gtk_widget_set_hexpand(W(frame), 1)
             gtk_widget_set_vexpand(W(frame), 1)
             let cell = OpaquePointer(gtk_overlay_new())
-            let paintable = gtk_widget_paintable_new(W(surface.glArea))
+            let paintable = gtk_widget_paintable_new(W(surface.rootWidget))
             let picture = OpaquePointer(gtk_picture_new_for_paintable(paintable))
             gtk_picture_set_can_shrink(picture, 1)
             gtk_picture_set_content_fit(picture, GTK_CONTENT_FIT_FILL)
@@ -216,7 +222,7 @@ extension AppController {
             gtk_widget_set_valign(W(caption), GTK_ALIGN_END)
             gtk_widget_set_margin_start(W(caption), 8)
             gtk_widget_set_margin_bottom(W(caption), 8)
-            let statusIcon = OpaquePointer(gtk_image_new())
+            let statusIcon = OpaquePointer(gtk_label_new(nil))
             dashboardRuntime.statusIcons[member] = statusIcon
             gtk_box_append(cast(caption), W(statusIcon))
             let captionLabel = OpaquePointer(gtk_label_new("\(sessionName) · \(paneName)"))
@@ -289,22 +295,10 @@ extension AppController {
     }
 
     func updateDashboardStatusIndicators() {
+        let settings = linuxSettingsStore().load()
         for (member, icon) in dashboardRuntime.statusIcons {
             let indicator = store.session(withID: member.session)?.agentIndicator ?? AgentIndicator()
-            for colorClass in ["agterm-status-active", "agterm-status-completed", "agterm-status-blocked"] {
-                gtk_widget_remove_css_class(W(icon), colorClass)
-            }
-            gtk_widget_remove_css_class(W(icon), "agterm-blink")
-            guard let iconName = Self.statusIcon(indicator.status) else {
-                gtk_widget_set_visible(W(icon), 0)
-                continue
-            }
-            iconName.withCString { gtk_image_set_from_icon_name(icon, $0) }
-            if let colorClass = Self.statusColorClass(indicator.status) {
-                gtk_widget_add_css_class(W(icon), colorClass)
-            }
-            if indicator.blink { gtk_widget_add_css_class(W(icon), "agterm-blink") }
-            gtk_widget_set_visible(W(icon), 1)
+            Self.applyStatusGlyph(indicator, settings: settings, to: icon)
         }
     }
 

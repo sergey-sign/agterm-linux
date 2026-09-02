@@ -19,6 +19,38 @@ final class SessionPickerRowContext {
 
 @MainActor
 extension AppController {
+    func sessionSwitcherScroller(containing rows: OpaquePointer) -> OpaquePointer? {
+        guard let scroller = op(gtk_scrolled_window_new()) else { return nil }
+        let metrics = InterfaceMetrics(fontSize: linuxSettingsStore().load().effectiveInterfaceFontSize)
+        let windowHeight = Double(max(1, gtk_widget_get_height(W(window))))
+        let maxHeight = Int32(metrics.fittedPanelHeight(windowHeight: windowHeight, topFraction: 0))
+        let deckWidth = Double(max(1, gtk_widget_get_width(W(deck))))
+        let width = Int32(metrics.fittedPanelWidth(
+            idealAtDefault: 460, windowWidth: deckWidth, terminalAreaInset: 0))
+        gtk_widget_set_halign(W(scroller), GTK_ALIGN_CENTER)
+        gtk_widget_set_valign(W(scroller), GTK_ALIGN_CENTER)
+        gtk_scrolled_window_set_policy(scroller, GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC)
+        gtk_scrolled_window_set_max_content_height(scroller, maxHeight)
+        gtk_scrolled_window_set_propagate_natural_height(scroller, 1)
+        gtk_scrolled_window_set_min_content_width(scroller, width)
+        gtk_scrolled_window_set_max_content_width(scroller, width)
+        gtk_scrolled_window_set_propagate_natural_width(scroller, 1)
+        gtk_scrolled_window_set_child(scroller, W(rows))
+        return scroller
+    }
+
+    func sessionPickerScroller(containing rows: OpaquePointer) -> OpaquePointer? {
+        guard let scroller = op(gtk_scrolled_window_new()) else { return nil }
+        let metrics = InterfaceMetrics(fontSize: linuxSettingsStore().load().effectiveInterfaceFontSize)
+        let windowHeight = Double(max(1, gtk_widget_get_height(W(window))))
+        let maxHeight = Int32(metrics.fittedPanelHeight(windowHeight: windowHeight, topFraction: 0.12))
+        gtk_scrolled_window_set_policy(scroller, GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC)
+        gtk_scrolled_window_set_max_content_height(scroller, maxHeight)
+        gtk_scrolled_window_set_propagate_natural_height(scroller, 1)
+        gtk_scrolled_window_set_child(scroller, W(rows))
+        return scroller
+    }
+
     /// Open the mouse-accessible twin of the Ctrl-Tab MRU switcher or attention palette.
     /// These are interactive-only popovers, so no control-socket command is meaningful.
     func showSessionPicker(attention: Bool, anchor: OpaquePointer?) {
@@ -34,7 +66,9 @@ extension AppController {
         }
         guard !sessions.isEmpty else { return }
 
-        dismissSessionPicker()
+        // Read the capture BEFORE the dismissal consumes it (see `popupPopover`).
+        let heldSearchEntry = searchEntryCaptureSurvives(sessionPickerPopover)
+        dismissSessionPicker(refocus: false)
         guard let popover = op(gtk_popover_new()), let rows = op(gtk_box_new(GTK_ORIENTATION_VERTICAL, 2)) else {
             return
         }
@@ -45,11 +79,12 @@ extension AppController {
         gtk_widget_set_parent(W(popover), W(anchor))
         gtk_popover_set_position(POPOVER(popover), GTK_POS_BOTTOM)
         gtk_widget_add_css_class(W(rows), "agterm-session-picker")
+        gtk_widget_add_css_class(W(rows), "agterm-interface-panel")
         for margin in [gtk_widget_set_margin_top, gtk_widget_set_margin_bottom,
                        gtk_widget_set_margin_start, gtk_widget_set_margin_end] {
             margin(W(rows), 6)
         }
-        gtk_widget_set_size_request(W(rows), 320, -1)
+        gtk_widget_set_size_request(W(rows), interfacePanelWidth(320), -1)
 
         for session in sessions {
             guard let button = op(gtk_button_new()), let row = op(gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8)),
@@ -61,11 +96,9 @@ extension AppController {
                 gtk_widget_set_name(W(button), $0)
             }
 
-            if attention, let iconName = Self.statusIcon(session.agentIndicator.status),
-               let icon = op(gtk_image_new_from_icon_name(iconName)) {
-                if let colorClass = Self.statusColorClass(session.agentIndicator.status) {
-                    gtk_widget_add_css_class(W(icon), colorClass)
-                }
+            if attention, let icon = Self.makeStatusGlyph(
+                session.agentIndicator, settings: linuxSettingsStore().load()
+            ) {
                 gtk_box_append(cast(row), W(icon))
             }
 
@@ -96,49 +129,62 @@ extension AppController {
             gtk_box_append(cast(rows), W(button))
         }
 
+        guard let scroller = sessionPickerScroller(containing: rows) else {
+            dismissSessionPicker()
+            return
+        }
         connect(popover, "closed", unsafeBitCast(onSessionPickerClosed as @convention(c)
             (OpaquePointer?, gpointer?) -> Void, to: GCallback.self),
             Unmanaged.passUnretained(self).toOpaque())
-        gtk_popover_set_child(POPOVER(popover), W(rows))
-        gtk_popover_popup(POPOVER(popover))
+        gtk_popover_set_child(POPOVER(popover), W(scroller))
+        popupPopover(popover, keepingCapture: heldSearchEntry)
     }
 
-    func updateRecentSessionsButton() {
+    /// `refocusOnDismiss: false` only from inside `rebuildSidebar()`, whose tail repair takes over.
+    func updateRecentSessionsButton(refocusOnDismiss: Bool = true) {
         guard let button = recentSessionsButton else { return }
         let hasOther = store.recentSessions(limit: 2).contains { $0 != store.selectedSessionID }
         gtk_widget_set_sensitive(W(button), hasOther ? 1 : 0)
         gtk_widget_set_opacity(W(button), hasOther ? 1 : 0.35)
-        if !hasOther, sessionPickerPopover != nil, !sessionPickerShowsAttention { dismissSessionPicker() }
+        if !hasOther, sessionPickerPopover != nil, !sessionPickerShowsAttention {
+            dismissSessionPicker(refocus: refocusOnDismiss)
+        }
     }
 
     func activateSessionPickerRow(_ context: SessionPickerRowContext) {
         let id = context.sessionID
         let attention = context.attention
         let statusPane = context.statusPane
-        dismissSessionPicker()
+        // Read the capture BEFORE the dismissal consumes it; unconditional, NOT through
+        // `searchEntryCaptureSurvives` — see that helper's boundary note. `refocus: false` because this
+        // handler re-targets focus itself below.
+        let popoverHeldSearchEntry = popoverTookKeyboardFromSearchEntry
+        dismissSessionPicker(refocus: false)
         selectSession(id)
         if attention {
             handleAutoFollow(id, statusPane: statusPane)
-        } else {
-            focusedSurface(for: id)?.grabFocus()
         }
+        // The attention leg needs this too: `handleAutoFollow` is shared with the auto-follow timer and
+        // declines to focus while a quick terminal is visible. Entry restore first.
+        if !(popoverHeldSearchEntry && restoreSearchEntryFocus()) { focusActiveSurface() }
     }
 
-    func dismissSessionPicker() {
+    /// Programmatic dismissal; Escape and click-away arrive at `sessionPickerDidClose` instead. The state
+    /// is cleared BEFORE `detachPopover(popdown: true)` pops it down.
+    func dismissSessionPicker(refocus: Bool = true) {
         guard let popover = sessionPickerPopover else { return }
-        sessionPickerPopover = nil
-        sessionPickerShowsAttention = false
-        sessionPickerContexts.removeAll()
-        if sessionPickerSuppressesAutoFollow {
-            sessionPickerSuppressesAutoFollow = false
-            resumeAutoFollow()
-        }
-        gtk_popover_popdown(POPOVER(popover))
-        gtk_widget_unparent(W(popover))
+        clearSessionPickerState()
+        detachPopover(popover, popdown: true, refocus: refocus)
     }
 
+    /// GTK dismissed the picker itself: Escape, or a click away.
     func sessionPickerDidClose(_ popover: OpaquePointer?) {
-        guard popover == sessionPickerPopover else { return }
+        guard let popover, popover == sessionPickerPopover else { return }
+        clearSessionPickerState()
+        detachPopover(popover, popdown: false)
+    }
+
+    private func clearSessionPickerState() {
         sessionPickerPopover = nil
         sessionPickerShowsAttention = false
         sessionPickerContexts.removeAll()
@@ -146,7 +192,6 @@ extension AppController {
             sessionPickerSuppressesAutoFollow = false
             resumeAutoFollow()
         }
-        gtk_widget_unparent(W(popover))
     }
 }
 

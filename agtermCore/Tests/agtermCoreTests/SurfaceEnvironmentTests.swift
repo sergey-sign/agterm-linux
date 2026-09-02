@@ -15,7 +15,6 @@ struct SurfaceEnvironmentTests {
             programVersion: "0.12.0"
         )
         let quickEnv = SurfaceEnvironment.quickTerminal(
-            windowID: windowID,
             socketPath: "/tmp/agterm.sock",
             programVersion: "0.12.0"
         )
@@ -88,7 +87,6 @@ struct SurfaceEnvironmentTests {
         )
 
         #expect(env["AGTERM_PANE"] == expected)
-        // pane injection must not disturb the existing identifiers
         #expect(env["AGTERM_ENABLED"] == "1")
         #expect(env["AGTERM_SESSION_ID"] == "11111111-1111-1111-1111-111111111111")
         #expect(env["AGTERM_SOCKET"] == "/tmp/agterm.sock")
@@ -109,7 +107,6 @@ struct SurfaceEnvironmentTests {
         )
 
         #expect(env["AGTERM_PANE"] == nil)
-        // the full identifier set is unchanged when no pane is given
         #expect(env == [
             "AGTERM_ENABLED": "1",
             "AGTERM_SESSION_ID": "11111111-1111-1111-1111-111111111111",
@@ -135,7 +132,6 @@ struct SurfaceEnvironmentTests {
         )
 
         #expect(env["AGTERM_PANE_ID"] == "surface-token-abc")
-        // the token rides alongside the role, not instead of it
         #expect(env["AGTERM_PANE"] == "right")
     }
 
@@ -156,24 +152,23 @@ struct SurfaceEnvironmentTests {
         #expect(env["AGTERM_PANE_ID"] == nil)
     }
 
-    @Test func quickTerminalEnvironmentOmitsSessionAndWorkspaceIdentifiers() {
-        let windowID = UUID(uuidString: "22222222-2222-2222-2222-222222222222")!
-
+    /// The panel is one per app and belongs to no window, so it carries no window id either — an untargeted
+    /// `agtermctl` run from it resolves the active window like any other caller.
+    @Test func quickTerminalEnvironmentOmitsSessionWorkspaceAndWindowIdentifiers() {
         let env = SurfaceEnvironment.quickTerminal(
-            windowID: windowID,
             socketPath: "/tmp/agterm.sock",
             programVersion: "0.12.0"
         )
 
         #expect(env == [
             "AGTERM_ENABLED": "1",
-            "AGTERM_WINDOW_ID": "22222222-2222-2222-2222-222222222222",
             "AGTERM_SOCKET": "/tmp/agterm.sock",
             "TERM_PROGRAM": "agterm",
             "TERM_PROGRAM_VERSION": "0.12.0",
         ])
         #expect(env["AGTERM_SESSION_ID"] == nil)
         #expect(env["AGTERM_WORKSPACE_ID"] == nil)
+        #expect(env["AGTERM_WINDOW_ID"] == nil)
     }
 
     @Test func emptySocketPathIsStillEmitted() {
@@ -188,5 +183,28 @@ struct SurfaceEnvironmentTests {
         )
 
         #expect(env["AGTERM_SOCKET"] == "")
+    }
+
+    /// both factories must always SET the variable. The shipped status hooks drop `--socket` when it is
+    /// absent, and `agtermctl` then resolves the default path — another instance's.
+    @Test func bothFactoriesAlwaysSetTheSocketVariable() {
+        let sessionID = UUID(uuidString: "11111111-1111-1111-1111-111111111111")!
+        let windowID = UUID(uuidString: "22222222-2222-2222-2222-222222222222")!
+        let unavailable = "/tmp/agterm.sock.unavailable"
+
+        let sessionEnv = SurfaceEnvironment.session(
+            sessionID: sessionID,
+            windowID: nil,
+            workspaceID: nil,
+            socketPath: unavailable,
+            programVersion: "0.12.0"
+        )
+        let quickEnv = SurfaceEnvironment.quickTerminal(
+            socketPath: unavailable,
+            programVersion: "0.12.0"
+        )
+
+        #expect(sessionEnv["AGTERM_SOCKET"] == unavailable)
+        #expect(quickEnv["AGTERM_SOCKET"] == unavailable)
     }
 }

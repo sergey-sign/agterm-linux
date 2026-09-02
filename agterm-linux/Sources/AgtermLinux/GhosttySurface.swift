@@ -6,15 +6,28 @@ import CGtk
 import agtermCore
 import Foundation
 
+enum LinuxOverlayExitCapture {
+    static func consume(_ file: String) -> Int? {
+        defer { try? FileManager.default.removeItem(atPath: file) }
+        guard let text = try? String(contentsOfFile: file, encoding: .utf8) else { return nil }
+        return OverlayCapture.parseExitCode(text)
+    }
+}
+
 @MainActor
 final class GhosttySurface: TerminalSurface {
+    /// Stable surface-local host. The GtkGLArea stays its child while the host is reparented for terminal
+    /// zoom and overlays; a creation failure adds its diagnostic here and cannot cover sibling surfaces.
+    let rootWidget: OpaquePointer
     /// The GtkGLArea widget (stored as OpaquePointer; cast at GTK call sites).
     let glArea: OpaquePointer
     private(set) var surface: ghostty_surface_t?
+    var isRealized: Bool { surface != nil }
     /// The key controller + a GtkIMContext for composed input (dead-keys / compose / CJK): key events are
     /// filtered through the IM, which commits the composed text via the `commit` signal.
     private var keyController: OpaquePointer?
     private var imContext: OpaquePointer?
+    private var creationErrorLabel: OpaquePointer?
 
     /// The owning session's id (so the host can route close/title back to the model).
     let sessionID: UUID
@@ -27,6 +40,10 @@ final class GhosttySurface: TerminalSurface {
     private let cwd: String
     /// Optional explicit command; nil runs the user's default login shell.
     private let command: String?
+    /// A fixed background owned by an overlay surface rather than the underlying session.
+    private let fixedBackgroundColor: String?
+    /// Program overlays use the theme default unless they explicitly own a color.
+    private let usesSessionWatermark: Bool
     /// Whether command surfaces should linger on ghostty's "press any key" prompt after exit.
     private let waitAfterCommand: Bool
     /// Scratch/overlay/quick terminals are transient covers; their OSC title/PWD must not overwrite the
@@ -38,7 +55,10 @@ final class GhosttySurface: TerminalSurface {
     /// Optional text fed to the shell at startup (restore-running-command re-runs the captured argv);
     /// runs INSIDE the shell so its exit returns to a prompt (unlike `command`).
     private let initialInput: String?
-    /// `AGTERM_*` (and any other) env vars to inject into the spawned shell.
+    /// `AGTERM_*` (and any other) env vars to inject into the spawned shell, plus the pre-launch
+    /// GDK_DISABLE/GDK_DEBUG values `main()` overwrote — this init is the single choke point every
+    /// surface role (main, split, scratch, overlay, quick) goes through, so the restore is merged here
+    /// rather than at each construction site.
     private let env: [String: String]
     /// The last libghostty-requested pointer state. GTK may receive visibility, link-hover, and shape
     /// actions independently, so keep all three and re-apply their precedence instead of letting one
@@ -68,31 +88,45 @@ final class GhosttySurface: TerminalSurface {
         }
     }
 
+    /// A host-supplied size estimate (logical GTK units) for a surface whose GtkGLArea carries no
+    /// allocation of its own. Set ONLY by `syncOverlay`'s floating branch — see `pushSize`.
+    var sizeFallback: (width: Int32, height: Int32)?
+
     /// Set by the host: the shell process exited.
     var onExit: (() -> Void)?
+    private var exitCodeFile: String?
+    private var onExitCodeCaptured: ((Int) -> Void)?
     private var didHandleProcessExit = false
 
     isolated deinit {
         if let surface { ghostty_surface_free(surface) }
         ownedConfigs.forEach { ghostty_config_free($0) }
         configurationStorage?.release()
+        if let exitCodeFile { try? FileManager.default.removeItem(atPath: exitCodeFile) }
     }
 
     init(sessionID: UUID, cwd: String, command: String? = nil, env: [String: String] = [:],
          controller: AppController? = nil, waitAfterCommand: Bool = false,
          role: LinuxSurfaceRole = .main, reportsPaneState: Bool = true,
-         fontSize: Double? = nil, initialInput: String? = nil) {
+         fontSize: Double? = nil, initialInput: String? = nil, backgroundColor: String? = nil,
+         usesSessionWatermark: Bool = true) {
         self.sessionID = sessionID
         self.controller = controller
         self.role = role
         self.cwd = cwd
         self.command = command
+        fixedBackgroundColor = backgroundColor
+        self.usesSessionWatermark = usesSessionWatermark
         self.waitAfterCommand = waitAfterCommand
         self.reportsPaneState = reportsPaneState
         self.fontSize = fontSize
         self.initialInput = initialInput
-        self.env = env
+        self.env = gdkEnvironment.childEnvironment(merging: env)
+        rootWidget = OpaquePointer(gtk_overlay_new())
         glArea = OpaquePointer(gtk_gl_area_new())
+        gtk_overlay_set_child(rootWidget, W(glArea))
+        gtk_widget_set_hexpand(W(rootWidget), 1)
+        gtk_widget_set_vexpand(W(rootWidget), 1)
         gtk_gl_area_set_allowed_apis(GLA(glArea), GDK_GL_API_GL)
         gtk_gl_area_set_has_depth_buffer(GLA(glArea), 0)
         gtk_widget_set_hexpand(W(glArea), 1)
@@ -156,15 +190,27 @@ final class GhosttySurface: TerminalSurface {
     // MARK: - Lifecycle
 
     func realize() {
+        if LinuxSurfaceFailureInjection.failure(for: role) == .glContext {
+            reportGLContextFailure(message: "injected by AGTERM_ATSPI_SURFACE_FAILURE")
+            return
+        }
         gtk_gl_area_make_current(GLA(glArea))
-        guard gtk_gl_area_get_error(GLA(glArea)) == nil else {
-            FileHandle.standardError.write(Data("agterm: GtkGLArea failed to create a GL context\n".utf8))
-            // Defer until window construction completes, but retain the surface's owner rather than
-            // whichever window becomes frontmost before the main-loop hop runs.
-            runOnMain { [weak controller] in MainActor.assumeIsolated { controller?.showGLError() } }
+        if let error = gtk_gl_area_get_error(GLA(glArea)) {
+            // The GError belongs to the GLArea (never freed here), and its message is the only place the
+            // real reason is named — the overlay stays generic, so this line is the diagnostic of record.
+            let message = error.pointee.message.map { String(cString: $0) }
+            reportGLContextFailure(message: message)
             return
         }
         createSurface()
+    }
+
+    private func reportGLContextFailure(message: String? = nil) {
+        let line = LinuxGdkPolicy.glContextErrorLine(message: message)
+        FileHandle.standardError.write(Data((line + "\n").utf8))
+        // Defer until window construction completes, but retain the surface's owner rather than
+        // whichever window becomes frontmost before the main-loop hop runs.
+        runOnMain { [weak controller] in MainActor.assumeIsolated { controller?.showGLError() } }
     }
 
     func realizeWidgetIfNeeded() {
@@ -192,6 +238,7 @@ final class GhosttySurface: TerminalSurface {
             workingDirectory: cwd, command: command, initialInput: initialInput, environment: env
         ) else {
             FileHandle.standardError.write(Data("agterm: could not allocate libghostty surface configuration\n".utf8))
+            showCreationFailure()
             return
         }
         configurationStorage = storage
@@ -199,30 +246,75 @@ final class GhosttySurface: TerminalSurface {
         if command != nil {
             cfg.wait_after_command = waitAfterCommand
         }
-        surface = ghostty_surface_new(app, &cfg)
+        let appearanceSide = LinuxAppearanceSide(isDark: AppController.systemIsDark)
+        GhosttyApp.shared.applyColorScheme(appearanceSide)
+        if LinuxSurfaceFailureInjection.failure(for: role) == .creation {
+            surface = nil
+        } else {
+            surface = ghostty_surface_new(app, &cfg)
+        }
         guard let surface else {
+            // libghostty exposes no error value here and may reject one surface for fonts, renderer,
+            // config, terminal initialization, or allocation. Keep the diagnostic on this exact host;
+            // only GtkGLArea's proven context error is display-wide.
+            FileHandle.standardError.write(Data("agterm: libghostty rejected the surface\n".utf8))
+            showCreationFailure()
             storage.release()
             configurationStorage = nil
             return
         }
+        clearCreationFailure()
         ghostty_surface_set_content_scale(surface, Double(scale), Double(scale))
         pushSize()
         ghostty_surface_set_focus(surface, true)
-        applyColorScheme()   // report the system light/dark scheme (OSC color-scheme queries)
+        applyColorScheme(appearanceSide)   // report the system light/dark scheme (OSC color-scheme queries)
         feed(GhosttyApp.shared.currentThemeOSC)   // push theme colors the embedded GL renderer won't adopt from config
-        if controller?.store.session(withID: sessionID)?.backgroundWatermark != nil {
+        if fixedBackgroundColor != nil
+                || usesSessionWatermark && controller?.store.session(withID: sessionID)?.backgroundWatermark != nil {
             applyWatermarkFromSession()
         }
     }
 
+    private func showCreationFailure() {
+        let presentation = LinuxSurfaceFailurePresentation.resolve(.creation, role: role)
+        guard presentation.scope == .surfaceLocal else { return }
+        if let label = creationErrorLabel {
+            gtk_label_set_text(label, presentation.message)
+            return
+        }
+        guard let label = op(gtk_label_new(presentation.message)) else { return }
+        gtk_label_set_justify(label, GTK_JUSTIFY_CENTER)
+        gtk_label_set_wrap(label, 1)
+        gtk_widget_set_halign(W(label), GTK_ALIGN_CENTER)
+        gtk_widget_set_valign(W(label), GTK_ALIGN_CENTER)
+        gtk_widget_set_can_target(W(label), 0)
+        gtk_widget_add_css_class(W(label), "agterm-surface-error")
+        creationErrorLabel = label
+        gtk_overlay_add_overlay(rootWidget, W(label))
+    }
+
+    private func clearCreationFailure() {
+        guard let label = creationErrorLabel else { return }
+        gtk_overlay_remove_overlay(rootWidget, W(label))
+        creationErrorLabel = nil
+    }
+
+    /// Size the surface at CREATION — the only path that reaches the fallback, since `createSurface()`
+    /// is guarded by `surface == nil` and every later size change goes through `resize(width:height:)`.
+    /// Precedence: the widget's own allocation, then the stored estimate, then the deck allocation, then
+    /// the clamp. Only the floating overlay needs a STORED estimate — its frame is
+    /// `gtk_widget_set_visible(0)` and never laid out at all while its session is backgrounded, while
+    /// every other surface is in layout and is corrected by the `GtkGLArea::resize` that follows.
     private func pushSize() {
         guard let surface else { return }
-        let viewport = GhosttySurfaceGeometry.initialBackingSize(
+        let inputs = GhosttySurfaceGeometry.InitialSizeInputs(
             gtkWidth: gtk_widget_get_width(W(glArea)),
             gtkHeight: gtk_widget_get_height(W(glArea)),
-            scaleFactor: gtk_widget_get_scale_factor(W(glArea))
-        )
-        ghostty_surface_set_size(surface, viewport.width, viewport.height)
+            scaleFactor: gtk_widget_get_scale_factor(W(glArea)),
+            storedFallback: sizeFallback,
+            deckFallback: controller?.deckAllocationSize())
+        GhosttySurfaceGeometry.pushInitialSize(
+            inputs, setSurfaceSize: { ghostty_surface_set_size(surface, $0, $1) })
     }
 
     func render() {
@@ -245,8 +337,9 @@ final class GhosttySurface: TerminalSurface {
     /// Inject text as keystrokes (the control channel's session.type): printable runs go
     /// as key-with-text, each newline as a Return keypress (keycode 36 = XKB Return). NOT
     /// ghostty_surface_text, whose bracketed-paste wrapping suppresses Enter.
-    func inject(text: String) {
-        guard let surface else { return }
+    @discardableResult
+    func inject(text: String) -> Bool {
+        guard let surface else { return false }
         // Split into printable runs + Return keys via the shared segmenter (one typing policy for both
         // platforms); send each run as text and each line break as a real Return key press.
         for segment in KeystrokeSegments.split(text) {
@@ -267,6 +360,7 @@ final class GhosttySurface: TerminalSurface {
                 _ = ghostty_surface_key(surface, ke)
             }
         }
+        return true
     }
 
     /// Feed raw bytes into the terminal as if read from the pty — used to push theme colors (OSC 11/10/4/…)
@@ -278,12 +372,6 @@ final class GhosttySurface: TerminalSurface {
     }
 
     // MARK: - In-terminal search (libghostty replies via the START/END/TOTAL/SELECTED actions)
-
-    /// Apply a rebuilt ghostty config to this live surface (theme change). The caller owns `config`.
-    func applyConfig(_ config: ghostty_config_t) {
-        guard let surface else { return }
-        ghostty_surface_update_config(surface, config)
-    }
 
     func applyWatermarkFromSession(windowOpacity: Double? = nil, settings: AppSettings? = nil) {
         // An explicit session.background set/clear owns the config overlay until a program emits OSC 11
@@ -298,7 +386,9 @@ final class GhosttySurface: TerminalSurface {
         let session = controller?.store.session(withID: sessionID)
         let watermark = oscBackgroundColorHex.map {
             BackgroundWatermark(kind: .color, colorHex: $0)
-        } ?? session?.backgroundWatermark
+        } ?? fixedBackgroundColor.map {
+            BackgroundWatermark(kind: .color, colorHex: $0)
+        } ?? (usesSessionWatermark ? session?.backgroundWatermark : nil)
         guard force || watermark != nil || dashboardFontOverride != nil || session?.fontSize != nil else { return }
         let resolvedImagePath = session.flatMap {
             WatermarkRenderer.materialize(watermark, sessionID: $0.id)
@@ -319,7 +409,15 @@ final class GhosttySurface: TerminalSurface {
 
     func reapplyWatermarkIfNeeded(windowOpacity: Double? = nil, settings: AppSettings? = nil) {
         guard oscBackgroundColorHex != nil
-                || controller?.store.session(withID: sessionID)?.backgroundWatermark != nil else { return }
+                || fixedBackgroundColor != nil
+                || usesSessionWatermark
+                    && controller?.store.session(withID: sessionID)?.backgroundWatermark != nil else { return }
+        reapplyBackgroundOverlay(windowOpacity: windowOpacity, settings: settings)
+    }
+
+    /// Automatic appearance reconciliation restores every per-session overlay.
+    /// Explicit reloads keep the watermark-only path.
+    func reapplySessionConfigIfNeeded(windowOpacity: Double? = nil, settings: AppSettings? = nil) {
         reapplyBackgroundOverlay(windowOpacity: windowOpacity, settings: settings)
     }
 
@@ -328,9 +426,28 @@ final class GhosttySurface: TerminalSurface {
     /// retained/re-applied per surface across config reloads.
     func applyOSCBackground(red: UInt8, green: UInt8, blue: UInt8) {
         let hex = String(format: "#%02X%02X%02X", red, green, blue)
-        guard oscBackgroundColorHex != hex else { return }
-        oscBackgroundColorHex = hex
-        reapplyBackgroundOverlay()
+        let inheritedColor = usesSessionWatermark
+            ? controller?.store.session(withID: sessionID)?.backgroundWatermark
+                .flatMap { $0.kind == .color ? $0.colorHex : nil }
+            : nil
+        let sessionColor = fixedBackgroundColor ?? inheritedColor
+        let baseline = OSCBackgroundPolicy.baseline(
+            oscOverlayActive: oscBackgroundColorHex != nil,
+            surfaceBackground: sessionColor,
+            themeBackground: GhosttyApp.shared.currentThemeBackgroundHex
+        )
+        switch OSCBackgroundPolicy.decide(
+            incoming: hex, themeBackground: baseline, current: oscBackgroundColorHex
+        ) {
+        case .apply(let color):
+            oscBackgroundColorHex = color
+            reapplyBackgroundOverlay()
+        case .reset:
+            oscBackgroundColorHex = nil
+            reapplyBackgroundOverlay(force: true)
+        case .ignore:
+            break
+        }
     }
 
     func startSearch() { performBindingAction("start_search") }
@@ -459,47 +576,11 @@ final class GhosttySurface: TerminalSurface {
         applyMouseCursor()
     }
 
-    /// Set the pointer shape over this surface (GHOSTTY_ACTION_MOUSE_SHAPE). ghostty's shapes are named
-    /// after CSS cursors, which GTK accepts directly; preserve the complete libghostty set.
+    /// Set the pointer shape over this surface (GHOSTTY_ACTION_MOUSE_SHAPE). The enum→CSS-name
+    /// mapping lives in `MouseShapeCursorName` (host-free, unit-tested, covers the complete
+    /// libghostty set including GHOSTTY_MOUSE_SHAPE_DEFAULT → the arrow).
     func setMouseShape(_ shape: ghostty_action_mouse_shape_e) {
-        let name: String
-        switch shape {
-        case GHOSTTY_MOUSE_SHAPE_ALIAS: name = "alias"
-        case GHOSTTY_MOUSE_SHAPE_ALL_SCROLL: name = "all-scroll"
-        case GHOSTTY_MOUSE_SHAPE_CELL: name = "cell"
-        case GHOSTTY_MOUSE_SHAPE_COL_RESIZE: name = "col-resize"
-        case GHOSTTY_MOUSE_SHAPE_CONTEXT_MENU: name = "context-menu"
-        case GHOSTTY_MOUSE_SHAPE_COPY: name = "copy"
-        case GHOSTTY_MOUSE_SHAPE_CROSSHAIR: name = "crosshair"
-        case GHOSTTY_MOUSE_SHAPE_E_RESIZE: name = "e-resize"
-        case GHOSTTY_MOUSE_SHAPE_EW_RESIZE: name = "ew-resize"
-        case GHOSTTY_MOUSE_SHAPE_HELP: name = "help"
-        case GHOSTTY_MOUSE_SHAPE_MOVE: name = "move"
-        case GHOSTTY_MOUSE_SHAPE_N_RESIZE: name = "n-resize"
-        case GHOSTTY_MOUSE_SHAPE_NE_RESIZE: name = "ne-resize"
-        case GHOSTTY_MOUSE_SHAPE_NESW_RESIZE: name = "nesw-resize"
-        case GHOSTTY_MOUSE_SHAPE_NO_DROP: name = "no-drop"
-        case GHOSTTY_MOUSE_SHAPE_NOT_ALLOWED: name = "not-allowed"
-        case GHOSTTY_MOUSE_SHAPE_NS_RESIZE: name = "ns-resize"
-        case GHOSTTY_MOUSE_SHAPE_NW_RESIZE: name = "nw-resize"
-        case GHOSTTY_MOUSE_SHAPE_NWSE_RESIZE: name = "nwse-resize"
-        case GHOSTTY_MOUSE_SHAPE_POINTER: name = "pointer"
-        case GHOSTTY_MOUSE_SHAPE_PROGRESS: name = "progress"
-        case GHOSTTY_MOUSE_SHAPE_GRAB: name = "grab"
-        case GHOSTTY_MOUSE_SHAPE_GRABBING: name = "grabbing"
-        case GHOSTTY_MOUSE_SHAPE_ROW_RESIZE: name = "row-resize"
-        case GHOSTTY_MOUSE_SHAPE_S_RESIZE: name = "s-resize"
-        case GHOSTTY_MOUSE_SHAPE_SE_RESIZE: name = "se-resize"
-        case GHOSTTY_MOUSE_SHAPE_SW_RESIZE: name = "sw-resize"
-        case GHOSTTY_MOUSE_SHAPE_TEXT: name = "text"
-        case GHOSTTY_MOUSE_SHAPE_VERTICAL_TEXT: name = "vertical-text"
-        case GHOSTTY_MOUSE_SHAPE_W_RESIZE: name = "w-resize"
-        case GHOSTTY_MOUSE_SHAPE_WAIT: name = "wait"
-        case GHOSTTY_MOUSE_SHAPE_ZOOM_IN: name = "zoom-in"
-        case GHOSTTY_MOUSE_SHAPE_ZOOM_OUT: name = "zoom-out"
-        default: name = "text"
-        }
-        mouseShapeName = name
+        mouseShapeName = MouseShapeCursorName.cssName(for: shape)
         applyMouseCursor()
     }
 
@@ -508,15 +589,22 @@ final class GhosttySurface: TerminalSurface {
         name.withCString { gtk_widget_set_cursor_from_name(W(glArea), $0) }
     }
 
-    /// Push the current system light/dark scheme to the surface (at create + on style-manager change).
-    func applyColorScheme() {
+    /// Push the captured system light/dark scheme to the surface (at create + on style-manager change).
+    func applyColorScheme(_ side: LinuxAppearanceSide) {
         guard let surface else { return }
-        let dark = adw_style_manager_get_dark(adw_style_manager_get_default()) != 0
-        ghostty_surface_set_color_scheme(surface, dark ? GHOSTTY_COLOR_SCHEME_DARK : GHOSTTY_COLOR_SCHEME_LIGHT)
+        ghostty_surface_set_color_scheme(
+            surface, side.isDark ? GHOSTTY_COLOR_SCHEME_DARK : GHOSTTY_COLOR_SCHEME_LIGHT)
     }
 
-    func grabFocus() {
-        _ = gtk_widget_grab_focus(W(glArea))
+    func grabFocus(supersedingPopoverCapture: Bool = false) {
+        // Explicit user/control transfers are newer than any search-entry owner captured before a
+        // popover took the keyboard. Implicit repair grabs (window reactivation and popover dismissal)
+        // deliberately keep the capture so the entry can be restored after GTK moves focus transiently.
+        let mapped = gtk_widget_get_mapped(W(glArea)) != 0
+        let accepted = gtk_widget_grab_focus(W(glArea)) != 0
+        if mapped, accepted, supersedingPopoverCapture {
+            controller?.invalidatePopoverSearchEntryCapture()
+        }
     }
 
     /// Force libghostty to redraw this surface (e.g. after a split re-layout), mirroring the macOS
@@ -528,7 +616,7 @@ final class GhosttySurface: TerminalSurface {
 
     // MARK: - Input
 
-    func keyPressed(keyval: UInt32, keycode: UInt32, state: UInt32) -> Bool {
+    func keyPressed(keyval: UInt32, keycode: UInt32, state: UInt32, event: OpaquePointer?) -> Bool {
         guard let surface else { return false }
         controller?.noteUserActivity()
 
@@ -544,7 +632,8 @@ final class GhosttySurface: TerminalSurface {
         // the fixed arrow/page/font fallback). All the dispatch logic lives in AppController.handleKey so
         // this handler stays thin; ghostty still gets its own binds (Ctrl+Shift+C/V) when handleKey passes.
         if controller?.handleKey(keyval: keyval, keycode: keycode, state: state,
-                                 sessionID: sessionID, origin: self) == true {
+                                 sessionID: sessionID, origin: self,
+                                 context: shortcutKeyContext(event: event, keycode: keycode)) == true {
             return true
         }
 
@@ -560,7 +649,10 @@ final class GhosttySurface: TerminalSurface {
         var ke = ghostty_input_key_s()
         ke.action = GHOSTTY_ACTION_PRESS
         ke.keycode = keycode                 // GDK hardware keycode == XKB == ghostty's Linux native code
-        ke.mods = ghosttyMods(state)
+        // Modifier-only keys: X11/GDK reports the state PRIOR to the event, so the pressed key's own
+        // bit is still clear — add it back (see ModifierKeyMods) or libghostty's hover/cursor-shape
+        // recompute waits for the next mouse motion. Non-modifier keys pass through unchanged.
+        ke.mods = ghosttyMods(ModifierKeyMods.adjustedState(forKeyval: keyval, state: state, pressing: true))
         ke.consumed_mods = GHOSTTY_MODS_NONE
 
         let unicode = gdk_keyval_to_unicode(keyval)
@@ -578,6 +670,21 @@ final class GhosttySurface: TerminalSurface {
             ke.text = nil
             return ghostty_surface_key(surface, ke)
         }
+    }
+
+    /// Forward a modifier-only key release to libghostty (upstream macOS `keyUp` parity): the raw
+    /// release state still carries the released key's bit (X11 prior-state), so it is cleared via
+    /// ModifierKeyMods before the event goes out.
+    func modifierKeyReleased(keyval: UInt32, keycode: UInt32, state: UInt32) {
+        guard let surface else { return }
+        var ke = ghostty_input_key_s()
+        ke.action = GHOSTTY_ACTION_RELEASE
+        ke.keycode = keycode
+        ke.mods = ghosttyMods(ModifierKeyMods.adjustedState(forKeyval: keyval, state: state, pressing: false))
+        ke.consumed_mods = GHOSTTY_MODS_NONE
+        ke.text = nil
+        ke.unshifted_codepoint = 0
+        _ = ghostty_surface_key(surface, ke)
     }
 
     /// The IM context committed composed text (dead-key/compose/CJK result) → send it to the terminal.
@@ -650,9 +757,25 @@ final class GhosttySurface: TerminalSurface {
     func handleProcessExit() {
         guard !didHandleProcessExit else { return }
         didHandleProcessExit = true
+        finishExitCodeCapture()
         let exit = onExit
         onExit = nil
         exit?()
+    }
+
+    func captureExitCode(from file: String, onCapture: @escaping (Int) -> Void) {
+        exitCodeFile = file
+        onExitCodeCaptured = onCapture
+    }
+
+    private func finishExitCodeCapture() {
+        guard let file = exitCodeFile else { return }
+        defer {
+            exitCodeFile = nil
+            onExitCodeCaptured = nil
+        }
+        guard let code = LinuxOverlayExitCapture.consume(file) else { return }
+        onExitCodeCaptured?(code)
     }
 
     var shouldCloseOnChildExitAction: Bool { command != nil && !waitAfterCommand }
@@ -667,7 +790,9 @@ final class GhosttySurface: TerminalSurface {
     }
 
     func terminalNotificationOrigin() -> LinuxTerminalNotificationOrigin? {
-        guard let controller, let pane = role.notificationPane else { return nil }
+        guard let controller else { return nil }
+        let liveOverlayPane = controller.store.session(withID: sessionID)?.paneOverlayRole(of: self)
+        guard let pane = role.notificationPane(liveOverlayPane: liveOverlayPane) else { return nil }
         let appActive = gtk_window_is_active(WIN(controller.windowPointer)) != 0
         let firingIsFocused = appActive
             && gtk_widget_get_mapped(W(glArea)) != 0
@@ -696,10 +821,12 @@ final class GhosttySurface: TerminalSurface {
     // MARK: - TerminalSurface
 
     func teardown() {
+        onExit = nil
         if let surface {
             ghostty_surface_free(surface)
             self.surface = nil
         }
+        finishExitCodeCapture()
         ownedConfigs.forEach { ghostty_config_free($0) }
         ownedConfigs = []
         configurationStorage?.release()
@@ -730,14 +857,22 @@ private let surfaceRender: @MainActor @convention(c) (OpaquePointer?, OpaquePoin
 private let surfaceResize: @MainActor @convention(c) (OpaquePointer?, Int32, Int32, gpointer?) -> Void = { _, w, h, data in
     MainActor.assumeIsolated { wrap(data)?.resize(width: w, height: h) }
 }
-private let surfaceKeyPressed: @MainActor @convention(c) (OpaquePointer?, UInt32, UInt32, UInt32, gpointer?) -> gboolean = { _, keyval, keycode, state, data in
-    MainActor.assumeIsolated { (wrap(data)?.keyPressed(keyval: keyval, keycode: keycode, state: state) ?? false) ? 1 : 0 }
+private let surfaceKeyPressed: @MainActor @convention(c) (OpaquePointer?, UInt32, UInt32, UInt32, gpointer?) -> gboolean = { controller, keyval, keycode, state, data in
+    MainActor.assumeIsolated {
+        let event = controller.flatMap { gtk_event_controller_get_current_event($0) }
+        return (wrap(data)?.keyPressed(
+            keyval: keyval, keycode: keycode, state: state, event: event
+        ) ?? false) ? 1 : 0
+    }
 }
-/// Ctrl release commits the Ctrl-Tab session-switch cycle (the only key release agterm reacts to; ghostty
-/// tracks its own key state internally).
-private let surfaceKeyReleased: @MainActor @convention(c) (OpaquePointer?, UInt32, UInt32, UInt32, gpointer?) -> Void = { _, keyval, _, _, data in
+/// Ctrl release commits the Ctrl-Tab session-switch cycle; modifier-only releases also reach
+/// libghostty (macOS `flagsChanged` parity) so its hover/cursor state tracks the transition itself.
+private let surfaceKeyReleased: @MainActor @convention(c) (OpaquePointer?, UInt32, UInt32, UInt32, gpointer?) -> Void = { _, keyval, keycode, state, data in
     if keyval == 0xFFE3 || keyval == 0xFFE4 {   // Control_L / Control_R
         MainActor.assumeIsolated { wrap(data)?.controller?.endSessionSwitch() }
+    }
+    if ModifierKeyMods.modifierBit(forKeyval: keyval) != nil {
+        MainActor.assumeIsolated { wrap(data)?.modifierKeyReleased(keyval: keyval, keycode: keycode, state: state) }
     }
 }
 private let surfaceFocusEnter: @MainActor @convention(c) (OpaquePointer?, gpointer?) -> Void = { _, data in
@@ -746,7 +881,9 @@ private let surfaceFocusEnter: @MainActor @convention(c) (OpaquePointer?, gpoint
         surface.setFocus(true)
         surface.imFocus(true)
         // Tell the controller which pane took focus so a split session's displayName/title/cwd track it.
-        surface.controller?.surfaceDidFocus(surface.sessionID, isSplit: surface.isSplitPane)
+        let livePane = surface.controller?.store.session(withID: surface.sessionID)?.paneOverlayRole(of: surface)
+        surface.controller?.surfaceDidFocus(
+            surface.sessionID, isSplit: livePane == .right || surface.isSplitPane)
     }
 }
 private let surfaceFocusLeave: @MainActor @convention(c) (OpaquePointer?, gpointer?) -> Void = { _, data in
@@ -767,7 +904,7 @@ private let surfacePreeditChanged: @MainActor @convention(c) (OpaquePointer?, gp
 }
 private let surfaceClicked: @MainActor @convention(c) (OpaquePointer?, Int32, Double, Double, gpointer?) -> Void = { gesture, _, x, y, data in
     MainActor.assumeIsolated {
-        wrap(data)?.grabFocus()
+        wrap(data)?.grabFocus(supersedingPopoverCapture: true)
         wrap(data)?.mouseButton(gesture, pressed: true, x: x, y: y)
     }
 }
@@ -792,7 +929,7 @@ private let surfaceDropString: @MainActor @convention(c) (OpaquePointer?, Unsafe
         if UUID(uuidString: payload) != nil { return 0 }
         if payload.hasPrefix("w:"), UUID(uuidString: String(payload.dropFirst(2))) != nil { return 0 }
         guard let text = ShellEscape.dropPayload(payload) else { return 0 }
-        surface.grabFocus()
+        surface.grabFocus(supersedingPopoverCapture: true)
         surface.inject(text: text)
         return 1
     }
@@ -824,7 +961,7 @@ private let surfaceDropFiles: @MainActor @convention(c) (OpaquePointer?, UnsafeP
 
         let text = parts.filter { !$0.isEmpty }.joined(separator: " ")
         guard !text.isEmpty else { return 0 }
-        surface.grabFocus()
+        surface.grabFocus(supersedingPopoverCapture: true)
         surface.inject(text: text)
         return 1
     }

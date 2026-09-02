@@ -39,9 +39,9 @@ struct IntegrationCommandTests {
         #expect(result.status == 0)
         let object = try #require(JSONSerialization.jsonObject(with: Data(result.output.utf8)) as? [String: Any])
         let items = try #require(object["items"] as? [[String: Any]])
-        #expect(items.count == 5)
+        #expect(items.count == 6)
         #expect(items.compactMap { $0["kind"] as? String } == [
-            "cli", "claude-hooks", "codex-hooks", "pi-hooks", "agent-skill",
+            "cli", "claude-hooks", "codex-hooks", "pi-hooks", "opencode-plugin", "agent-skill",
         ])
         #expect(!result.output.contains("socket"))
 
@@ -136,11 +136,13 @@ private final class CLIFixture {
         try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: resources, withIntermediateDirectories: true)
         if copyResources {
-            let source = packageRoot.deletingLastPathComponent().appendingPathComponent("agterm/Resources")
-            for name in ["agent-status", "agent-skill"] {
-                try FileManager.default.copyItem(at: source.appendingPathComponent(name),
-                                                 to: resources.appendingPathComponent(name))
-            }
+            let root = packageRoot.deletingLastPathComponent()
+            try FileManager.default.copyItem(
+                at: root.appendingPathComponent("agterm/Resources/agent-status"),
+                to: resources.appendingPathComponent("agent-status"))
+            try FileManager.default.copyItem(
+                at: root.appendingPathComponent("plugins/agterm/skills/agterm"),
+                to: resources.appendingPathComponent("agent-skill"))
         }
     }
 

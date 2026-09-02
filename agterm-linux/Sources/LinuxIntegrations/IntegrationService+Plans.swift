@@ -151,6 +151,8 @@ public extension IntegrationService {
         appendCodexPlan(steps: &steps, warnings: &warnings, conflicts: &conflicts, operations: &operations)
         try appendPiPlan(source: source, steps: &steps, warnings: &warnings,
                          conflicts: &conflicts, operations: &operations)
+        try appendOpenCodePlan(source: source, steps: &steps, warnings: &warnings,
+                               conflicts: &conflicts, operations: &operations)
 
         if operations.contains(where: \.changesFilesystem) {
             // The preview established both assets as dependencies even when the installed hooks directory
@@ -462,6 +464,65 @@ private extension IntegrationService {
             detail: "Copy the managed Pi lifecycle extension without a backup."
         ))
         warnings.append("Restart Pi or run /reload after installing or updating its extension.")
+    }
+
+    func appendOpenCodePlan(
+        source package: URL, steps: inout [IntegrationPlanStep],
+        warnings: inout [String], conflicts: inout [String],
+        operations: inout [IntegrationOperation]
+    ) throws {
+        let home = environment.homeDirectory.path
+        let base = environment.homeDirectory.appendingPathComponent(
+            ".config/opencode", isDirectory: true)
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: base.path, isDirectory: &isDirectory) else {
+            warnings.append(
+                "No ~/.config/opencode directory was detected; the OpenCode plugin will be skipped.")
+            return
+        }
+        guard isDirectory.boolValue else {
+            conflicts.append("\(base.path) exists but is not a directory.")
+            return
+        }
+        let source = package.appendingPathComponent(AgentHooksInstall.opencodePluginRelativePath)
+        guard let bundled = try? String(contentsOf: source, encoding: .utf8),
+              bundled.contains(AgentHooksInstall.opencodePluginMarker) else {
+            throw IntegrationServiceError.invalidResource(
+                "The bundled OpenCode plugin is missing or invalid: \(source.path)"
+            )
+        }
+        let path = URL(fileURLWithPath: AgentHooksInstall.opencodePluginPath(home: home))
+        let pathFingerprint = IntegrationFilesystem.fingerprint(path)
+        let exists = pathFingerprint.value != "missing"
+        let existing: String?
+        do {
+            existing = try IntegrationFilesystem.read(path)
+        } catch {
+            conflicts.append("\(path.path) could not be read and will not be changed.")
+            return
+        }
+        guard AgentHooksInstall.mayOverwriteOpenCodePlugin(
+            fileExists: exists, existingContents: existing
+        ) else {
+            conflicts.append("\(path.path) is user-owned and will not be changed.")
+            return
+        }
+        guard existing != bundled else { return }
+        let target = IntegrationFilesystem.resolvedWriteTarget(path)
+        operations.append(.copyFile(
+            source: source.path,
+            path: path.path,
+            target: target.path,
+            expectedSource: IntegrationFilesystem.fingerprint(source),
+            expectedPath: pathFingerprint,
+            expectedTarget: IntegrationFilesystem.fingerprint(target)
+        ))
+        steps.append(IntegrationPlanStep(
+            action: exists ? "Update" : "Install",
+            path: path.path,
+            detail: "Copy the managed OpenCode lifecycle plugin without a backup."
+        ))
+        warnings.append("Restart OpenCode after installing or updating its lifecycle plugin.")
     }
 
     func backupFingerprint(for target: URL) -> FileFingerprint {

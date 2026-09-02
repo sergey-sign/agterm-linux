@@ -5,9 +5,9 @@ import agtermCore
 extension AppController {
     func makeAgentStatusSettingsPage(_ settings: AppSettings) -> OpaquePointer? {
         let page = preferencesPage("Agent Status", name: .agentStatus, icon: "media-record-symbolic")
-        let colors = preferencesGroup("Colors")
+        let colors = preferencesGroup("Colors and Shapes")
         addStatusColorRow(
-            colors, title: "Active", hex: settings.activeStatusColorHex ?? "#3584e4",
+            colors, title: "Active", hex: settings.activeStatusColorHex ?? "#DBD9E6",
             handler: unsafeBitCast(onSettingsActiveColor, to: GCallback.self))
         addStatusColorRow(
             colors, title: "Blocked", hex: settings.blockedStatusColorHex ?? "#e5a50a",
@@ -15,6 +15,15 @@ extension AppController {
         addStatusColorRow(
             colors, title: "Completed", hex: settings.completedStatusColorHex ?? "#2ec27e",
             handler: unsafeBitCast(onSettingsCompletedColor, to: GCallback.self))
+        addStatusShapeRow(
+            colors, title: "Active shape", shape: settings.effectiveStatusShape(for: .active),
+            handler: unsafeBitCast(onSettingsActiveShape, to: GCallback.self))
+        addStatusShapeRow(
+            colors, title: "Blocked shape", shape: settings.effectiveStatusShape(for: .blocked),
+            handler: unsafeBitCast(onSettingsBlockedShape, to: GCallback.self))
+        addStatusShapeRow(
+            colors, title: "Completed shape", shape: settings.effectiveStatusShape(for: .completed),
+            handler: unsafeBitCast(onSettingsCompletedShape, to: GCallback.self))
         adw_preferences_page_add(cast(page), cast(colors))
 
         let sound = preferencesGroup("Sound")
@@ -87,6 +96,17 @@ extension AppController {
         adw_action_row_add_suffix(cast(row), W(button))
         adw_preferences_group_add(cast(group), W(row))
     }
+
+    private func addStatusShapeRow(
+        _ group: OpaquePointer?, title: String, shape: StatusShape?, handler: GCallback?
+    ) {
+        let shapes = StatusShape.allCases
+        let selected = shapes.firstIndex(of: shape ?? .circle) ?? 0
+        adw_preferences_group_add(
+            cast(group),
+            W(preferencesCombo(
+                title, values: shapes.map(\.displayName), selected: selected, handler: handler)))
+    }
 }
 
 private let onSettingsActiveColor: @MainActor @convention(c) (OpaquePointer?, OpaquePointer?, gpointer?) -> Void = { button, _, _ in
@@ -97,6 +117,21 @@ private let onSettingsBlockedColor: @MainActor @convention(c) (OpaquePointer?, O
 }
 private let onSettingsCompletedColor: @MainActor @convention(c) (OpaquePointer?, OpaquePointer?, gpointer?) -> Void = { button, _, _ in
     MainActor.assumeIsolated { controllerForWidget(button)?.setStatusColor(.completed, fromButton: button) }
+}
+private let onSettingsActiveShape: @MainActor @convention(c) (OpaquePointer?, OpaquePointer?, gpointer?) -> Void = { row, _, _ in
+    MainActor.assumeIsolated {
+        controllerForWidget(row)?.setStatusShape(.active, at: Int(adw_combo_row_get_selected(cast(row))))
+    }
+}
+private let onSettingsBlockedShape: @MainActor @convention(c) (OpaquePointer?, OpaquePointer?, gpointer?) -> Void = { row, _, _ in
+    MainActor.assumeIsolated {
+        controllerForWidget(row)?.setStatusShape(.blocked, at: Int(adw_combo_row_get_selected(cast(row))))
+    }
+}
+private let onSettingsCompletedShape: @MainActor @convention(c) (OpaquePointer?, OpaquePointer?, gpointer?) -> Void = { row, _, _ in
+    MainActor.assumeIsolated {
+        controllerForWidget(row)?.setStatusShape(.completed, at: Int(adw_combo_row_get_selected(cast(row))))
+    }
 }
 private let onSettingsBlockedSound: @MainActor @convention(c) (OpaquePointer?, OpaquePointer?, gpointer?) -> Void = { row, _, _ in
     MainActor.assumeIsolated {

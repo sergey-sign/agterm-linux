@@ -2,24 +2,50 @@ import CGtk
 import Foundation
 import agtermCore
 
+@MainActor func synchronizeLiveColorScheme(_ side: LinuxAppearanceSide) {
+    GhosttyApp.shared.applyColorScheme(side)
+    for controller in gWindows.values {
+        for surface in controller.configurableSurfaces {
+            surface.applyColorScheme(side)
+        }
+    }
+}
+
 @MainActor
 extension AppController {
-    func applySettings(_ settings: AppSettings) {
-        let lines = Self.ghosttyLines(for: settings)
-        guard let config = GhosttyApp.shared.buildConfig(extraLines: lines) else { return }
+    @discardableResult
+    func applySettings(
+        _ settings: AppSettings,
+        preserveSessionConfig: Bool = false,
+        appearanceSide: LinuxAppearanceSide? = nil
+    ) -> Bool {
+        let side = appearanceSide ?? LinuxAppearanceSide(isDark: Self.systemIsDark)
+        let lines = Self.ghosttyLines(for: settings, isDark: side.isDark)
+        guard let config = GhosttyApp.shared.buildConfig(extraLines: lines) else { return false }
         let chromeColors = GhosttyConfigTheme.colors(from: config)
-        GhosttyApp.shared.updateConfig(config)
-        for controller in gWindows.values {
-            for surface in controller.configurableSurfaces {
-                surface.applyConfig(config)
-                surface.reapplyWatermarkIfNeeded(
-                    windowOpacity: settings.backgroundOpacity ?? 1, settings: settings)
-            }
-        }
+        GhosttyApp.shared.currentThemeBackgroundHex = chromeColors.background
+        synchronizeLiveColorScheme(side)
+        // The app-level update is the single base application: pinned libghostty propagates it to
+        // every surface. Each surface then reasserts only its own overlay/zoom state.
+        let windowOpacity = settings.backgroundOpacity ?? 1
+        GhosttyConfigApplyPolicy.apply(
+            surfacesByWindow: gWindows.values.map { $0.configurableSurfaces },
+            preserveSessionConfig: preserveSessionConfig,
+            updateAppBaseConfig: { GhosttyApp.shared.updateConfig(config) },
+            reassertState: { surface, state in
+                switch state {
+                case .sessionOverlay:
+                    surface.reapplySessionConfigIfNeeded(
+                        windowOpacity: windowOpacity, settings: settings)
+                case .watermarkOnly:
+                    surface.reapplyWatermarkIfNeeded(
+                        windowOpacity: windowOpacity, settings: settings)
+                }
+            })
         ghostty_config_free(config)
 
         let osc = AppSettings.themeOSC(from: lines)
-        let activeTheme = settings.activeTheme(isDark: Self.systemIsDark)
+        let activeTheme = settings.activeTheme(isDark: side.isDark)
         let liveOSC = osc.isEmpty && activeTheme == nil ? AppSettings.themeResetOSC : osc
         GhosttyApp.shared.currentThemeOSC = liveOSC
         for controller in gWindows.values {
@@ -28,7 +54,17 @@ extension AppController {
                 surface.queueRender()
             }
             controller.applyWindowThemeColors(for: activeTheme, resolvedColors: chromeColors)
+            controller.updateAllPaneDimming(windowOpacity: settings.backgroundOpacity ?? 1)
         }
+        recordAppliedColorSchemeSide(side)
+        return true
+    }
+
+    /// Automatic appearance reconciliation restores complete per-session overlays.
+    /// Explicit config reload stays watermark-only.
+    func reloadConfigForAppearanceChange(_ side: LinuxAppearanceSide) -> Bool {
+        applySettings(
+            linuxSettingsStore().load(), preserveSessionConfig: true, appearanceSide: side)
     }
 
     func persist<V>(_ keyPath: WritableKeyPath<AppSettings, V>, _ value: V) {
@@ -83,6 +119,21 @@ extension AppController {
         }
     }
 
+    func setAutoHideInactiveSidebars(_ enabled: Bool) {
+        persist(\.autoHideSidebarInactiveWindows, enabled ? true : nil)
+        if enabled { applyInactiveWindowSidebarHidingIfEnabled() }
+    }
+
+    func setWorkspaceRowClickExpands(_ enabled: Bool) {
+        persist(\.workspaceRowClickExpands, enabled ? nil : false)
+    }
+
+    func applyInactiveWindowSidebarHidingIfEnabled() {
+        guard linuxSettingsStore().load().autoHideSidebarInactiveWindows == true else { return }
+        library.applyInactiveWindowSidebarHiding()
+        for controller in gWindows.values { controller.applySidebarVisibility() }
+    }
+
     func applyInterfaceElements(settings: AppSettings? = nil) {
         let settings = settings ?? linuxSettingsStore().load()
         let hidden = settings.resolvedHiddenInterfaceElements
@@ -96,7 +147,8 @@ extension AppController {
         let dividers = InterfaceElement.titlebarGroupDividers(countA: countA, countB: countB, countC: countC)
         gtk_widget_set_visible(W(titlebarDividerAfterA), dividers.afterA ? 1 : 0)
         gtk_widget_set_visible(W(titlebarDividerAfterB), dividers.afterB ? 1 : 0)
-        let footerVisible = !hidden.isSuperset(of: [.newWorkspace, .newSession, .flaggedView])
+        let footerVisible = !hidden.isSuperset(
+            of: [.newWorkspace, .newSession, .flaggedView, .focusFilter])
         gtk_widget_set_visible(W(bottomBar), footerVisible ? 1 : 0)
         updateTitle()
     }
@@ -133,7 +185,13 @@ extension AppController {
         let value = path?.trimmingCharacters(in: .whitespacesAndNewlines)
         persist(\.configDirectory, value?.isEmpty == false ? value : nil)
         ensureStarterFiles()
-        for controller in gWindows.values { _ = controller.reloadKeymapDiagnostics() }
+        // Through the seam, not a hand-written `gWindows` loop: a new config directory means a DIFFERENT
+        // keymap.conf, so every window must re-parse. The old loop bannered errors once PER WINDOW (each
+        // `reloadKeymapDiagnostics()` toasted its own count); this reports at most once, in this window.
+        // Do NOT read that banner as this path's user-visible reporting: an AdwToast lands on the window
+        // CONTENT, under the Settings dialog the user is still in. What they actually read is the Key
+        // Mapping page's Diagnostics group, which the caller rebuilds right after with the per-line detail.
+        reloadKeymapAllWindows(reportingIn: self)
         reloadConfig()
     }
 
@@ -255,6 +313,12 @@ extension AppController {
         }
     }
 
+    func setInterfaceFontSize(_ value: Double) {
+        let size = AppSettings.clampInterfaceFontSize(value)
+        persist(\.interfaceFontSize, size == AppSettings.defaultInterfaceFontSize ? nil : size)
+        for controller in gWindows.values { controller.applyInterfaceFontSize() }
+    }
+
     func setInactivePaneMute(_ value: Double) {
         let strength = Int(value)
         persist(\.inactivePaneMuteStrength,
@@ -274,6 +338,21 @@ extension AppController {
         case .completed: persist(\.completedStatusColorHex, hex)
         }
         installStatusColorCSS()
+    }
+
+    func setStatusShape(_ kind: StatusColorKind, at index: Int) {
+        let shapes = StatusShape.allCases
+        guard shapes.indices.contains(index) else { return }
+        let value = shapes[index] == .circle ? nil : shapes[index].rawValue
+        switch kind {
+        case .active: persist(\.activeStatusShape, value)
+        case .blocked: persist(\.blockedStatusShape, value)
+        case .completed: persist(\.completedStatusShape, value)
+        }
+        for controller in gWindows.values {
+            controller.rebuildSidebar()
+            controller.updateDashboardStatusIndicators()
+        }
     }
 
     func setBlockedSoundAtIndex(_ index: Int) {
@@ -328,6 +407,7 @@ extension AppController {
         settings.backgroundOpacity = nil
         settings.sidebarBackgroundShift = nil
         settings.sidebarFontSize = nil
+        settings.interfaceFontSize = nil
         settings.inactivePaneMuteStrength = nil
         try? linuxSettingsStore().save(settings)
         reloadConfig()
@@ -335,6 +415,7 @@ extension AppController {
             controller.applyToolbarMode()
             controller.applyWindowTranslucency()
             controller.applySidebarFontSize()
+            controller.applyInterfaceFontSize()
             controller.updateAllPaneDimming()
             controller.rebuildSidebar()
         }
@@ -346,6 +427,9 @@ extension AppController {
         settings.activeStatusColorHex = nil
         settings.blockedStatusColorHex = nil
         settings.completedStatusColorHex = nil
+        settings.activeStatusShape = nil
+        settings.blockedStatusShape = nil
+        settings.completedStatusShape = nil
         settings.blockedStatusSoundName = nil
         try? linuxSettingsStore().save(settings)
         installStatusColorCSS()

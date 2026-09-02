@@ -37,17 +37,22 @@ final class GhosttyApp: @unchecked Sendable {
     /// because the embedded OpenGL renderer doesn't adopt the config's default colors from the config file.
     /// Set at launch from the persisted theme; refreshed by AppController.previewTheme on every theme change.
     var currentThemeOSC: String = ""
+    var currentThemeBackgroundHex: String?
+    @MainActor private var appliedAppearanceSide: LinuxAppearanceSide?
 
-    func start() {
+    @MainActor func start(appearanceSide: LinuxAppearanceSide) {
         setGhosttyResourcesEnv()   // export GHOSTTY_RESOURCES_DIR before init + buildConfig read it
         ghostty_init(UInt(CommandLine.argc), CommandLine.unsafeArgv)
 
         // Persisted settings (font/size/theme/scroll) are layered on at launch so they survive
         // relaunch. Translucency is omitted: Linux has no window-level compositing yet.
         let saved = linuxSettingsStore().load()
-        let lines = AppController.ghosttyLines(for: saved)
+        let lines = AppController.ghosttyLines(for: saved, isDark: appearanceSide.isDark)
         currentThemeOSC = AppSettings.themeOSC(from: lines)
         let cfg = buildConfig(extraLines: lines)
+        if let cfg {
+            currentThemeBackgroundHex = GhosttyConfigTheme.colors(from: cfg).background
+        }
 
         var rt = ghostty_runtime_config_s()
         rt.userdata = Unmanaged.passUnretained(self).toOpaque()
@@ -70,6 +75,15 @@ final class GhosttyApp: @unchecked Sendable {
         }
 
         app = ghostty_app_new(&rt, cfg)
+        // libghostty starts with a light conditional state. Re-side and re-apply the app config before
+        // any surface mounts; otherwise a dark launch rebuilds each surface from config files and drops
+        // host-only env vars, initial input, and command fields from its surface configuration.
+        if let app, let cfg {
+            ghostty_app_set_color_scheme(
+                app, appearanceSide.isDark ? GHOSTTY_COLOR_SCHEME_DARK : GHOSTTY_COLOR_SCHEME_LIGHT)
+            ghostty_app_update_config(app, cfg)
+        }
+        appliedAppearanceSide = appearanceSide
         ghostty_config_free(cfg)
     }
 
@@ -78,6 +92,13 @@ final class GhosttyApp: @unchecked Sendable {
     func updateConfig(_ config: ghostty_config_t) {
         guard let app else { return }
         ghostty_app_update_config(app, config)
+    }
+
+    @MainActor func applyColorScheme(_ side: LinuxAppearanceSide) {
+        guard let app else { return }
+        ghostty_app_set_color_scheme(
+            app, side.isDark ? GHOSTTY_COLOR_SCHEME_DARK : GHOSTTY_COLOR_SCHEME_LIGHT)
+        appliedAppearanceSide = side
     }
 
     /// Build a ghostty config (bundled defaults + the user's ~/.config/ghostty + the given
@@ -95,7 +116,13 @@ final class GhosttyApp: @unchecked Sendable {
         if let scoped = Self.scopedGhosttyConfigPath(), FileManager.default.fileExists(atPath: scoped) {
             scoped.withCString { ghostty_config_load_file(cfg, $0) }
         }
-        if !extraLines.isEmpty, let extra = Self.writeTempConf(extraLines) {
+        // Distinct empty themes keep libghostty's conditional state active while the following agterm
+        // lines supply one fixed palette. This updates OSC color-scheme reports without changing colors.
+        let appearanceStateLines = Self.writeAppearanceStateThemes().map {
+            ["theme = light:\($0.light),dark:\($0.dark)"]
+        } ?? []
+        let runtimeLines = appearanceStateLines + extraLines
+        if let extra = Self.writeTempConf(runtimeLines) {
             extra.withCString { ghostty_config_load_file(cfg, $0) }
         }
         // Expand any `config-file = <path>` includes across the loaded layers (matches macOS ordering:
@@ -108,8 +135,15 @@ final class GhosttyApp: @unchecked Sendable {
 
     /// Build a config for one surface with a final per-session overlay (`background-image*`, solid
     /// `background`, and/or a font-size override). The returned config is owned by the caller.
+    ///
+    /// Resolves through the live theme-picker preview (hence `@MainActor`): the per-surface watermark
+    /// reapply runs off the preview's own OSC color-change action, so a persisted-settings base would
+    /// rebuild the surface with the OLD theme's palette mid-preview.
+    @MainActor
     func configWithOverlay(_ overlayText: String, settings: AppSettings? = nil) -> ghostty_config_t? {
-        let base = AppController.ghosttyLines(for: settings ?? linuxSettingsStore().load())
+        let base = AppController.ghosttyLines(
+            for: settings ?? AppController.resolvedThemeSettings(persisted: linuxSettingsStore().load()),
+            isDark: appliedAppearanceSide?.isDark ?? AppController.systemIsDark)
         let overlay = overlayText.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
         return buildConfig(extraLines: base + overlay)
     }
@@ -129,6 +163,15 @@ final class GhosttyApp: @unchecked Sendable {
         let path = (dir as NSString).appendingPathComponent("agterm-ghostty-runtime.conf")
         try? lines.joined(separator: "\n").write(toFile: path, atomically: true, encoding: .utf8)
         return path
+    }
+
+    private static func writeAppearanceStateThemes() -> (light: String, dark: String)? {
+        let dir = ProcessInfo.processInfo.environment["XDG_RUNTIME_DIR"] ?? NSTemporaryDirectory()
+        let light = (dir as NSString).appendingPathComponent("agterm-ghostty-empty-light-theme")
+        let dark = (dir as NSString).appendingPathComponent("agterm-ghostty-empty-dark-theme")
+        guard (try? "".write(toFile: light, atomically: true, encoding: .utf8)) != nil,
+              (try? "".write(toFile: dark, atomically: true, encoding: .utf8)) != nil else { return nil }
+        return (light, dark)
     }
 
     /// Coalesce libghostty wakeups (fired off the main thread, faster than the
@@ -191,8 +234,10 @@ final class GhosttyApp: @unchecked Sendable {
                 }
                 return true
             case GHOSTTY_ACTION_MOUSE_OVER_LINK:
-                // a non-null url means the pointer is over a hyperlink → show the hand cursor.
-                Self.wrapper(fromTarget: target)?.setLinkHover(action.action.mouse_over_link.url != nil)
+                // a non-empty url means the pointer is over a hyperlink → show the hand cursor.
+                // libghostty signals hover-clear with an EMPTY url (len == 0); the pointer is never NULL.
+                let action_ = action.action.mouse_over_link
+                Self.wrapper(fromTarget: target)?.setLinkHover(LinkHoverDecision.isActive(url: action_.url, len: action_.len))
                 return true
             case GHOSTTY_ACTION_MOUSE_SHAPE:
                 Self.wrapper(fromTarget: target)?.setMouseShape(action.action.mouse_shape)
@@ -233,6 +278,11 @@ final class GhosttyApp: @unchecked Sendable {
                     value = r.progress < 0 ? -1 : Int(r.progress)
                 }
                 Self.wrapper(fromTarget: target)?.applyProgress(value)
+                return true
+            case GHOSTTY_ACTION_RELOAD_CONFIG:
+                _ = GhosttyReloadPolicy.handle(isSoft: action.action.reload_config.soft) {
+                    gWindows.values.first?.reloadConfig()
+                }
                 return true
             case GHOSTTY_ACTION_CONFIG_CHANGE:
                 // ghostty reloaded its config (e.g. an external edit it picked up) — re-tint the sidebar in
@@ -289,7 +339,7 @@ final class GhosttyApp: @unchecked Sendable {
             try? uri.write(toFile: capturePath, atomically: true, encoding: .utf8)
         }
         #endif
-        uri.withCString { _ = g_app_info_launch_default_for_uri($0, nil, nil) }
+        launchDefaultHandler(forURI: uri)
     }
 
     // MARK: - Clipboard (GTK4 reads are async)

@@ -28,6 +28,42 @@ fi
 
 TAG="v$VERSION"
 DMG="$BUILD_DIR/agterm-$VERSION.dmg"
+
+# ── plugin manifest version ───────────────────────────────────────────────────
+# The agent skill also ships as a Claude Code / Codex plugin, and both plugin
+# managers key their install cache on the manifest "version" — an unbumped
+# manifest means an existing install never picks up the new skill, silently.
+# `gh release create` below runs with no --target, so the tag lands on whatever
+# origin/master points at: the bump must be both COMMITTED and PUSHED, and both
+# are checked here. This applies the bump and stops so the diff can be reviewed
+# and committed, rather than rewriting git history from inside a release script.
+PLUGIN_MANIFESTS=(
+  "$ROOT/plugins/agterm/.claude-plugin/plugin.json"
+  "$ROOT/plugins/agterm/.codex-plugin/plugin.json"
+  "$ROOT/.claude-plugin/marketplace.json"
+)
+for manifest in "${PLUGIN_MANIFESTS[@]}"; do
+  sed -i '' -E "s/(\"version\"[[:space:]]*:[[:space:]]*)\"[^\"]*\"/\1\"$VERSION\"/" "$manifest"
+done
+# against HEAD, not the index — a bare `git diff` compares the worktree to the
+# index, so a bump that was merely `git add`ed reads as clean and publishes stale.
+if ! git diff --quiet HEAD -- "${PLUGIN_MANIFESTS[@]}"; then
+  echo "==> bumped the plugin manifests to $VERSION — review and commit, then re-run:" >&2
+  git --no-pager diff --stat HEAD -- "${PLUGIN_MANIFESTS[@]}" >&2
+  exit 1
+fi
+# committed is not enough: the tag is cut from the remote, so verify the pushed
+# manifests carry this version too.
+if [ "$PUBLISH" = "1" ]; then
+  git fetch -q origin master
+  for manifest in "${PLUGIN_MANIFESTS[@]}"; do
+    rel="${manifest#"$ROOT"/}"
+    if ! git show "origin/master:$rel" 2>/dev/null | grep -q "\"version\"[[:space:]]*:[[:space:]]*\"$VERSION\""; then
+      echo "==> $rel on origin/master is not at $VERSION — push master first" >&2
+      exit 1
+    fi
+  done
+fi
 APP="$BUILD_DIR/DerivedData/Build/Products/Release/agterm.app"
 NOTARY_PROFILE="${AGTERM_NOTARY_PROFILE:-agterm-notary}"
 TAP_REPO="umputun/homebrew-apps"
@@ -108,13 +144,20 @@ xcodebuild -project agterm.xcodeproj -scheme agterm -configuration Release \
 
 # authoritative Developer ID signing — AFTER xcodebuild so nothing clobbers it,
 # with a secure --timestamp on every Mach-O (notarization requires it). Sign the
-# nested helper first (inside-out), then re-sign + seal the app bundle.
+# nested helper first (inside-out), then re-sign + seal the app bundle. The helper is signed
+# without --entitlements on purpose, and --deep must never be added to the app sign below:
+# --deep would stamp the app's TCC entitlements onto agtermctl, a standalone CLI on the user's
+# PATH. Same constraint as the build-phase re-seal in project.yml.
 if [ "$SIGNED" = "1" ]; then
   echo "==> signing Developer ID (timestamped)"
   codesign --force --options runtime --timestamp --sign "$SIGN_ID" "$APP/Contents/MacOS/agtermctl"
   codesign --force --options runtime --timestamp \
     --entitlements "$ROOT/agterm/agterm.entitlements" --sign "$SIGN_ID" "$APP"
   codesign --verify --deep --strict "$APP"
+  if codesign -d --entitlements - "$APP/Contents/MacOS/agtermctl" 2>/dev/null | grep -q 'com.apple.security'; then
+    echo "agtermctl carries entitlements: --deep must not be used on the app sign above" >&2
+    exit 1
+  fi
 fi
 
 # ── notarize + staple the app ─────────────────────────────────────────────────

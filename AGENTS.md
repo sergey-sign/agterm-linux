@@ -65,6 +65,41 @@ Use plain portable data types in shared code.
 For geometry or UI state, prefer simple Swift structs backed by `Double`/`Int` and convert at the platform
 boundary.
 
+## The GDK environment is set before GTK initializes
+
+Keep `LinuxGdkPolicy`'s GDK environment assignments the FIRST statements of `main()`.
+Nothing that initializes GTK or opens a display may be added above them, because GDK parses
+`GDK_DISABLE`/`GDK_DEBUG` exactly once while GTK initializes and an earlier display open turns the
+assignment into a silent no-op.
+A new site that spawns a child process or launches a desktop handler owes the matching pre-launch restore
+— see `agterm-linux/docs/main-loop.md`.
+
+## Main-actor deferred work must go through the `MainTimer` seam
+
+GTK owns the Linux main thread through `g_application_run`, and the GLib main loop drains neither
+libdispatch's main queue nor the Swift Concurrency main-actor executor.
+`DispatchQueue.main.async`/`asyncAfter`, `Task { @MainActor }` + `Task.sleep`, `Timer.scheduledTimer`, and
+`RunLoop` scheduling therefore compile, run, and silently never fire on Linux — the failure mode is silence,
+not a crash, so it survives review easily.
+This applies to shared `agtermCore` code too, where the dispatch dependency is easiest to miss because the
+file otherwise looks host-free.
+
+- Schedule deferred main-actor work through `agtermCore`'s `MainTimer` seam (`MainTimer.schedule(after:_:)`,
+  or `Debouncer` on top of it), never a dispatch or `Task.sleep` timer.
+- Hop to the main thread with `runOnMain` (`g_idle_add`), never `DispatchQueue.main.async`.
+  `runOnMain` lives in the Linux target, so host-free `agtermCore` has no hop seam: from main-actor core code
+  use `MainTimer.schedule(after: 0)`, and add a hop seam alongside `MainTimer` only if a real need appears.
+- Keep `MainTimer`'s default Dispatch-based so upstream macOS semantics are unchanged; the Linux app swaps in
+  the GLib implementation once, in `installGLibMainTimer()` at the top of `activateApplication`.
+- `DispatchQueue.global` is fine: global queues own their own threads.
+- Tests that swap the process-global `MainTimer.scheduleTimer` go through the `withFakeMainTimer` fixture —
+  its synchronous closure is what keeps a parallel test's timer from landing on the fake.
+  The Linux package cannot see that fixture, so `AgtermLinuxTests/GLibMainTimerTests.swift` installs the real
+  seam through its own synchronous `withGLibMainTimer` helper, under the same no-`await` contract.
+
+See `agterm-linux/docs/main-loop.md` for the full main-loop contract, the repro, and the unpersisted-preview
+override pattern that live previews need.
+
 ## Control API coverage is a first-class requirement
 
 When adding any user-visible feature or capability, evaluate how it should be driven over the control socket.
@@ -81,7 +116,7 @@ Skip control exposure only when it is genuinely meaningless, such as pure visual
 Call out that exemption explicitly.
 
 Whenever the Control API, keymap format, or window/workspace/session/pane model changes, update the bundled
-agent skill under `agterm/Resources/agent-skill/`.
+agent skill under `plugins/agterm/skills/agterm/`.
 That directory is the source of truth; never edit installed copies under user home directories.
 
 ## UI and platform work

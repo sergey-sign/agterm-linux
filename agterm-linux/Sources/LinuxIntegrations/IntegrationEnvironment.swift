@@ -91,7 +91,12 @@ public struct IntegrationEnvironment: Sendable {
 
         var root = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
         for _ in 0..<3 { root.deleteLastPathComponent() }
-        let checkout = root.appendingPathComponent("agterm/Resources/\(name)", isDirectory: true)
+        let checkout: URL
+        if name == "agent-skill" {
+            checkout = root.appendingPathComponent("plugins/agterm/skills/agterm", isDirectory: true)
+        } else {
+            checkout = root.appendingPathComponent("agterm/Resources/\(name)", isDirectory: true)
+        }
         return fm.fileExists(atPath: checkout.path) ? checkout : nil
     }
 

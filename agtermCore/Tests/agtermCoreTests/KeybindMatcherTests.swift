@@ -9,88 +9,99 @@ struct KeybindMatcherTests {
     private let cmdShiftU = Chord(mods: [.command, .shift], key: "u")
 
     @Test func simpleChordFires() {
-        let id = UUID()
-        var matcher = KeybindMatcher([([cmdShiftU], id)])
-        #expect(matcher.advance(cmdShiftU) == .fired(id))
+        let target = KeybindTarget.command(UUID())
+        var matcher = KeybindMatcher([([cmdShiftU], target)])
+        #expect(matcher.advance(cmdShiftU) == .fired(target))
         #expect(!matcher.isArmed)
     }
 
     @Test func unmatchedSingleChord() {
-        let id = UUID()
-        var matcher = KeybindMatcher([([cmdShiftU], id)])
+        let target = KeybindTarget.command(UUID())
+        var matcher = KeybindMatcher([([cmdShiftU], target)])
         #expect(matcher.advance(ctrlA) == .unmatched)
         #expect(!matcher.isArmed)
     }
 
     @Test func sequenceFiresOnSecondChord() {
-        let id = UUID()
-        var matcher = KeybindMatcher([([ctrlA, b], id)])
+        let target = KeybindTarget.command(UUID())
+        var matcher = KeybindMatcher([([ctrlA, b], target)])
         #expect(matcher.advance(ctrlA) == .armed)
         #expect(matcher.isArmed)
-        #expect(matcher.advance(b) == .fired(id))
+        #expect(matcher.advance(b) == .fired(target))
         #expect(!matcher.isArmed)
     }
 
     @Test func wrongSecondChordResetsAndUnmatches() {
-        let id = UUID()
-        var matcher = KeybindMatcher([([ctrlA, b], id)])
+        let target = KeybindTarget.command(UUID())
+        var matcher = KeybindMatcher([([ctrlA, b], target)])
         #expect(matcher.advance(ctrlA) == .armed)
         #expect(matcher.advance(c) == .unmatched)
         #expect(!matcher.isArmed)
-        // after reset the leader can be re-armed.
         #expect(matcher.advance(ctrlA) == .armed)
     }
 
     @Test func resetClearsPending() {
-        let id = UUID()
-        var matcher = KeybindMatcher([([ctrlA, b], id)])
+        let target = KeybindTarget.command(UUID())
+        var matcher = KeybindMatcher([([ctrlA, b], target)])
         #expect(matcher.advance(ctrlA) == .armed)
         matcher.reset()
         #expect(!matcher.isArmed)
-        // the follow-key alone now no longer completes the sequence.
         #expect(matcher.advance(b) == .unmatched)
     }
 
     @Test func twoSequencesSharingLeader() {
-        let idB = UUID()
-        let idC = UUID()
-        var matcher = KeybindMatcher([([ctrlA, b], idB), ([ctrlA, c], idC)])
+        let targetB = KeybindTarget.command(UUID())
+        let targetC = KeybindTarget.command(UUID())
+        var matcher = KeybindMatcher([([ctrlA, b], targetB), ([ctrlA, c], targetC)])
         #expect(matcher.advance(ctrlA) == .armed)
-        #expect(matcher.advance(b) == .fired(idB))
+        #expect(matcher.advance(b) == .fired(targetB))
 
         #expect(matcher.advance(ctrlA) == .armed)
-        #expect(matcher.advance(c) == .fired(idC))
+        #expect(matcher.advance(c) == .fired(targetC))
     }
 
     @Test func simpleAndSequenceCoexist() {
-        let simpleID = UUID()
-        let seqID = UUID()
-        var matcher = KeybindMatcher([([cmdShiftU], simpleID), ([ctrlA, b], seqID)])
-        #expect(matcher.advance(cmdShiftU) == .fired(simpleID))
+        let simpleTarget = KeybindTarget.command(UUID())
+        let sequenceTarget = KeybindTarget.command(UUID())
+        var matcher = KeybindMatcher([([cmdShiftU], simpleTarget), ([ctrlA, b], sequenceTarget)])
+        #expect(matcher.advance(cmdShiftU) == .fired(simpleTarget))
         #expect(matcher.advance(ctrlA) == .armed)
-        #expect(matcher.advance(b) == .fired(seqID))
+        #expect(matcher.advance(b) == .fired(sequenceTarget))
     }
 
     @Test func rePressingLeaderWhileArmedReArms() {
-        // armed on ctrl+a, a second ctrl+a is not a valid continuation but IS a fresh leader: it
-        // restarts the sequence rather than abandoning it, so the next 'b' still completes.
-        let id = UUID()
-        var matcher = KeybindMatcher([([ctrlA, b], id)])
+        let target = KeybindTarget.command(UUID())
+        var matcher = KeybindMatcher([([ctrlA, b], target)])
         #expect(matcher.advance(ctrlA) == .armed)
         #expect(matcher.advance(ctrlA) == .armed)
         #expect(matcher.isArmed)
-        #expect(matcher.advance(b) == .fired(id))
+        #expect(matcher.advance(b) == .fired(target))
     }
 
     @Test func wrongChordWhileArmedThatIsItselfASimpleBindFires() {
-        // armed on ctrl+a, a chord that completes no sequence but is itself a simple bind fires it
-        // (the press is not dropped just because a leader was pending).
-        let seqID = UUID()
-        let simpleID = UUID()
-        var matcher = KeybindMatcher([([ctrlA, b], seqID), ([cmdShiftU], simpleID)])
+        let sequenceTarget = KeybindTarget.command(UUID())
+        let simpleTarget = KeybindTarget.command(UUID())
+        var matcher = KeybindMatcher([([ctrlA, b], sequenceTarget), ([cmdShiftU], simpleTarget)])
         #expect(matcher.advance(ctrlA) == .armed)
-        #expect(matcher.advance(cmdShiftU) == .fired(simpleID))
+        #expect(matcher.advance(cmdShiftU) == .fired(simpleTarget))
         #expect(!matcher.isArmed)
+    }
+
+    @Test func alternativesShareOneTarget() {
+        let target = KeybindTarget.command(UUID())
+        var matcher = KeybindMatcher([([cmdShiftU], target), ([ctrlA, b], target)])
+        #expect(matcher.advance(cmdShiftU) == .fired(target))
+        #expect(matcher.advance(ctrlA) == .armed)
+        #expect(matcher.advance(b) == .fired(target))
+    }
+
+    @Test func builtinAndCommandTargetsCoexist() {
+        let command = KeybindTarget.command(UUID())
+        let builtin = KeybindTarget.builtin(.toggleSplit)
+        var matcher = KeybindMatcher([([cmdShiftU], command), ([ctrlA, b], builtin)])
+        #expect(matcher.advance(cmdShiftU) == .fired(command))
+        #expect(matcher.advance(ctrlA) == .armed)
+        #expect(matcher.advance(b) == .fired(builtin))
     }
 
     @Test func emptyMatcherUnmatches() {

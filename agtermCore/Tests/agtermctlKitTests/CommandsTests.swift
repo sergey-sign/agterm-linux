@@ -54,13 +54,24 @@ struct CommandsTests {
         #expect(try request(["workspace", "select", "--target", "ab"]) == ControlRequest(cmd: .workspaceSelect, target: "ab"))
     }
 
+    @Test func workspaceGo() throws {
+        #expect(try request(["workspace", "go", "--to", "next"]) == ControlRequest(cmd: .workspaceGo, args: ControlArgs(to: "next")))
+        let windowed = ControlRequest(cmd: .workspaceGo, args: ControlArgs(window: "w1", to: "prev"))
+        #expect(try request(["workspace", "go", "--to", "prev", "--window", "w1"]) == windowed)
+    }
+
+    // relative to what is current, so unlike its `workspace.*` siblings it carries no target at all
+    @Test func workspaceGoTakesNoTarget() {
+        #expect(throws: (any Error).self) { try Agtermctl.parseAsRoot(["workspace", "go", "--to", "next", "--target", "ab"]) }
+        #expect(throws: (any Error).self) { try Agtermctl.parseAsRoot(["workspace", "go"]) }
+    }
+
     @Test func workspaceMove() throws {
         let expected = ControlRequest(cmd: .workspaceMove, target: "active", args: ControlArgs(to: "top"))
         #expect(try request(["workspace", "move", "--to", "top"]) == expected)
     }
 
     @Test func workspaceMoveRequiresToFails() {
-        // --to has no default, so omitting it must fail to parse (the direction is validated server-side).
         #expect(throws: (any Error).self) { try Agtermctl.parseAsRoot(["workspace", "move"]) }
     }
 
@@ -73,8 +84,51 @@ struct CommandsTests {
         #expect(try request(["workspace", "focus", "on", "--target", "9f3c"]) == expected)
     }
 
+    @Test func workspaceFocusAddWithTarget() throws {
+        let expected = ControlRequest(cmd: .workspaceFocus, target: "9f3c", args: ControlArgs(mode: "add"))
+        #expect(try request(["workspace", "focus", "add", "--target", "9f3c"]) == expected)
+    }
+
     @Test func workspaceFocusRejectsBadMode() {
-        #expect(throws: (any Error).self) { try Agtermctl.parseAsRoot(["workspace", "focus", "sideways"]) }
+        // pin the exact allCases-derived message so an unrelated parse failure can't pass for it.
+        #expect(validationMessage(["workspace", "focus", "sideways"]) == "mode must be one of: on, off, toggle, add")
+    }
+
+    @Test func workspaceFocusHelpListsEveryModeAndWhatItDoesToTheFilter() {
+        // the abstract lists the raw values on its own, so asserting those alone would pass over a rotted
+        // hand-written argument help — assert each mode's whole clause instead.
+        let help = Workspace.Focus.helpMessage(columns: 400)
+        for mode in ControlWorkspaceFocusMode.allCases {
+            #expect(help.contains(mode.rawValue), "workspace focus help should list \(mode.rawValue), got: \(help)")
+            #expect(help.contains(mode.helpSummary),
+                    "workspace focus help should explain \(mode.rawValue)'s filter effect, got: \(help)")
+        }
+    }
+
+    @Test func workspaceFilterDefaultsToggle() throws {
+        #expect(try request(["workspace", "filter"]) == ControlRequest(cmd: .workspaceFilter, args: ControlArgs(mode: "toggle")))
+    }
+
+    @Test func workspaceFilterOn() throws {
+        #expect(try request(["workspace", "filter", "on"]) == ControlRequest(cmd: .workspaceFilter, args: ControlArgs(mode: "on")))
+    }
+
+    @Test func workspaceFilterOff() throws {
+        #expect(try request(["workspace", "filter", "off"]) == ControlRequest(cmd: .workspaceFilter, args: ControlArgs(mode: "off")))
+    }
+
+    @Test func workspaceFilterThreadsWindow() throws {
+        let expected = ControlRequest(cmd: .workspaceFilter, args: ControlArgs(mode: "on", window: "win"))
+        #expect(try request(["workspace", "filter", "on", "--window", "win"]) == expected)
+    }
+
+    @Test func workspaceFilterRejectsBadMode() {
+        #expect(validationMessage(["workspace", "filter", "sideways"]) == "mode must be on, off, or toggle")
+    }
+
+    @Test func workspaceFilterTakesNoTarget() {
+        // carrying only ClientOptions is what makes --target unknown here.
+        #expect(throws: (any Error).self) { try Agtermctl.parseAsRoot(["workspace", "filter", "on", "--target", "9f3c"]) }
     }
 
     @Test func workspaceCollapseDefaultsActive() throws {
@@ -106,36 +160,30 @@ struct CommandsTests {
     }
 
     @Test func sessionNewWithCreateWorkspace() throws {
-        // --create-workspace sets createWorkspace=true on the wire (omitted when the flag is absent).
         let expected = ControlRequest(cmd: .sessionNew, args: ControlArgs(workspaceName: "servers", createWorkspace: true))
         #expect(try request(["session", "new", "--workspace-name", "servers", "--create-workspace"]) == expected)
     }
 
     @Test func sessionNewWithNoSelect() throws {
-        // --no-select sets noSelect=true on the wire (omitted when the flag is absent).
         let expected = ControlRequest(cmd: .sessionNew, args: ControlArgs(noSelect: true))
         #expect(try request(["session", "new", "--no-select"]) == expected)
     }
 
     @Test func sessionNewWithCommandWait() throws {
-        // --wait rides with --command to hold the session open after the command exits (omitted otherwise).
         let expected = ControlRequest(cmd: .sessionNew, args: ControlArgs(command: "make test", wait: true))
         #expect(try request(["session", "new", "--command", "make test", "--wait"]) == expected)
     }
 
     @Test func sessionNewRejectsWaitWithoutCommand() {
-        // --wait holds a command surface, so it is meaningless without --command — validate() rejects it.
         #expect(validationMessage(["session", "new", "--wait"]) == "--wait requires --command")
     }
 
     @Test func sessionNewRejectsWorkspaceAndWorkspaceName() {
-        // both addressing modes set — validate() rejects it before any request is built.
         #expect(validationMessage(["session", "new", "--workspace", "active", "--workspace-name", "servers"])
             == "use either --workspace or --workspace-name, not both")
     }
 
     @Test func sessionNewRequiresWorkspaceNameForCreateWorkspace() {
-        // --create-workspace with no --workspace-name has nothing to create by id — validate() rejects it.
         #expect(validationMessage(["session", "new", "--create-workspace"]) == "--create-workspace requires --workspace-name")
     }
 
@@ -155,7 +203,6 @@ struct CommandsTests {
     }
 
     @Test func sessionNewRejectsAfterAndWorkspace() {
-        // the anchor sid already names the workspace, so placement can't also address one.
         #expect(validationMessage(["session", "new", "--after", "a", "--workspace", "ws1"])
             == "session.new takes --after/--before or a workspace, not both")
     }
@@ -171,7 +218,6 @@ struct CommandsTests {
     }
 
     @Test func sessionDuplicateDefaultsToActive() throws {
-        // no options at all: the target defaults to `active`, which names its own workspace and cwd.
         let expected = ControlRequest(cmd: .sessionDuplicate, target: "active")
         #expect(try request(["session", "duplicate"]) == expected)
     }
@@ -220,12 +266,10 @@ struct CommandsTests {
     }
 
     @Test func sessionMoveRequiresWorkspaceOrTo() {
-        // no placement intent at all — validate() rejects it with a usage message naming all three forms.
         #expect(validationMessage(["session", "move"]) == "provide a destination workspace, --to, or --after/--before")
     }
 
     @Test func sessionMoveRejectsWorkspaceAndTo() {
-        // both the workspace positional and --to are set — validate() rejects it with a usage message.
         #expect(validationMessage(["session", "move", "ws2", "--to", "up"]) == "provide a destination workspace or --to, not both")
     }
 
@@ -261,7 +305,6 @@ struct CommandsTests {
     }
 
     @Test func sessionMoveRejectsAfterAndWorkspace() {
-        // the anchor already names the workspace, so it can't also take a destination workspace.
         #expect(validationMessage(["session", "move", "ws2", "--after", "a"])
             == "session.move takes --after/--before or a workspace, not both")
     }
@@ -296,8 +339,8 @@ struct CommandsTests {
     }
 
     @Test func sessionTypeWithPaneLeft() throws {
-        // explicit --pane left is forwarded as "left"; the server treats nil and "left" identically (both
-        // the main pane), but the CLI still passes the value through rather than dropping it.
+        // the server treats nil and "left" identically, but the CLI passes the value through rather than
+        // dropping it.
         let req = try request(["session", "type", "ls\n", "--pane", "left"])
         #expect(req.args?.pane == "left")
     }
@@ -308,7 +351,7 @@ struct CommandsTests {
     }
 
     @Test func sessionTypeRejectsBadPane() {
-        // `other` is a session.focus mode, not a typable pane — type accepts left|right|scratch only.
+        // `other` is a session.focus mode, not a typable pane.
         #expect(validationMessage(["session", "type", "x", "--pane", "other"]) == "--pane must be left, right, or scratch")
     }
 
@@ -320,6 +363,28 @@ struct CommandsTests {
     @Test func sessionSplitOn() throws {
         let expected = ControlRequest(cmd: .sessionSplit, target: "active", args: ControlArgs(mode: "on"))
         #expect(try request(["session", "split", "on"]) == expected)
+    }
+
+    @Test func sessionSplitWithTargetAndWindow() throws {
+        let expected = ControlRequest(cmd: .sessionSplit, target: "s1", args: ControlArgs(mode: "off", window: "w1"))
+        #expect(try request(["session", "split", "off", "--target", "s1", "--window", "w1"]) == expected)
+    }
+
+    @Test func sessionSplitAcceptsAnOptionalAxis() throws {
+        let expected = ControlRequest(cmd: .sessionSplit, target: "active",
+                                      args: ControlArgs(mode: "toggle", axis: "horizontal"))
+        #expect(try request(["session", "split", "--axis", "horizontal"]) == expected)
+        #expect(validationMessage(["session", "split", "--axis", "diagonal"])
+            == "--axis must be vertical or horizontal")
+    }
+
+    @Test func sessionSplitClose() throws {
+        #expect(try request(["session", "split", "close"]) == ControlRequest(cmd: .sessionSplitClose, target: "active"))
+    }
+
+    @Test func sessionSplitCloseWithTargetAndWindow() throws {
+        let expected = ControlRequest(cmd: .sessionSplitClose, target: "s1", args: ControlArgs(window: "w1"))
+        #expect(try request(["session", "split", "close", "--target", "s1", "--window", "w1"]) == expected)
     }
 
     @Test func sessionScratchDefaultsToggle() throws {
@@ -342,6 +407,12 @@ struct CommandsTests {
         #expect(try request(["session", "focus", "right"]) == expected)
     }
 
+    @Test func sessionFocusAcceptsRoleAndAxisAliasesVerbatim() throws {
+        for pane in ["primary", "left", "top", "split", "right", "bottom"] {
+            #expect(try request(["session", "focus", pane]).args?.pane == pane)
+        }
+    }
+
     @Test func sessionResizeAbsolute() throws {
         let expected = ControlRequest(cmd: .sessionResize, target: "active", args: ControlArgs(ratio: 0.7))
         #expect(try request(["session", "resize", "--split-ratio", "0.7"]) == expected)
@@ -357,15 +428,23 @@ struct CommandsTests {
         #expect(try request(["session", "resize", "--grow-right", "0.05"]) == expected)
     }
 
+    @Test func sessionResizeRoleAndAxisAliasesKeepThePrimaryFractionConvention() throws {
+        for option in ["--grow-primary", "--grow-top"] {
+            #expect(try request(["session", "resize", option, "0.05"]).args?.ratioDelta == 0.05)
+        }
+        for option in ["--grow-split", "--grow-bottom"] {
+            #expect(try request(["session", "resize", option, "0.05"]).args?.ratioDelta == -0.05)
+        }
+    }
+
     @Test func sessionResizeRequiresExactlyOneForm() {
-        // neither form set, and two forms set — validate() rejects both with the same usage message.
         #expect(validationMessage(["session", "resize"])?.contains("exactly one") == true)
         #expect(validationMessage(["session", "resize", "--split-ratio", "0.7", "--grow-left", "0.1"])?
             .contains("exactly one") == true)
     }
 
     @Test func sessionResizeRejectsNonFinite() {
-        // nan/inf parse as Double but can't JSON-encode; validate() rejects them with a clean usage error.
+        // nan/inf parse as Double but can't JSON-encode, so validate() rejects them.
         #expect(validationMessage(["session", "resize", "--split-ratio", "nan"])?.contains("finite") == true)
         #expect(validationMessage(["session", "resize", "--grow-left", "inf"])?.contains("finite") == true)
         #expect(validationMessage(["session", "resize", "--split-ratio", "1e999"])?.contains("finite") == true)
@@ -387,7 +466,6 @@ struct CommandsTests {
     }
 
     @Test func sessionGoRequiresToFails() {
-        // --to has no default, so omitting it must fail to parse (the direction is validated server-side).
         #expect(throws: (any Error).self) { try Agtermctl.parseAsRoot(["session", "go"]) }
     }
 
@@ -426,7 +504,6 @@ struct CommandsTests {
     }
 
     @Test func sessionTextDefaultsActive() throws {
-        // bare `session text` reads the visible screen of the focused pane (no args beyond the base bag).
         #expect(try request(["session", "text"]) == ControlRequest(cmd: .sessionText, target: "active", args: ControlArgs()))
     }
 
@@ -455,8 +532,8 @@ struct CommandsTests {
     }
 
     @Test func sessionTextRejectsZeroLines() {
-        // a negative --lines (`-5`) is intercepted by ArgumentParser as a flag before validate() runs, so
-        // 0 is the CLI-reachable non-positive case the validation guards against.
+        // ArgumentParser intercepts a negative `-5` as a flag before validate() runs, so 0 is the only
+        // CLI-reachable non-positive case.
         #expect(validationMessage(["session", "text", "--lines", "0"]) == "--lines must be greater than 0")
     }
 
@@ -519,10 +596,41 @@ struct CommandsTests {
     }
 
     @Test func sessionStatusRejectsBadColor() {
-        // a non-#rrggbb color is rejected by validate() before any request is built; pin the exact message
-        // so an unrelated parse failure can't masquerade as color validation (matches the sibling
-        // `session background color` rejection tests).
+        // pin the exact message so an unrelated parse failure can't masquerade as color validation.
         #expect(validationMessage(["session", "status", "blocked", "--color", "nope"]) == "color must be a #rrggbb hex value")
+    }
+
+    @Test func sessionStatusWithShape() throws {
+        let req = try request(["session", "status", "blocked", "--shape", "triangle"])
+        #expect(req.cmd == .sessionStatus)
+        #expect(req.args?.status == "blocked")
+        #expect(req.args?.shape == "triangle")
+        #expect(req == ControlRequest(cmd: .sessionStatus, target: "active",
+                                      args: ControlArgs(status: "blocked", shape: "triangle")))
+    }
+
+    @Test(arguments: StatusShape.allCases)
+    func sessionStatusAcceptsEveryShape(_ shape: StatusShape) throws {
+        #expect(try request(["session", "status", "active", "--shape", shape.rawValue]).args?.shape == shape.rawValue)
+    }
+
+    @Test func sessionStatusWithoutShape() throws {
+        let req = try request(["session", "status", "active"])
+        #expect(req.args?.shape == nil)
+    }
+
+    @Test func sessionStatusRejectsUnknownShape() {
+        // pin the exact allCases-derived message so an unrelated parse failure can't pass for it.
+        #expect(validationMessage(["session", "status", "blocked", "--shape", "hexagon"])
+            == "shape must be one of: circle, square, triangle, diamond, capsule, star")
+    }
+
+    @Test func sessionStatusShapeHelpListsEveryShape() {
+        // the help is built from allCases, so a shape added later cannot leave `--help` stale.
+        let help = Session.Status.helpMessage(columns: 200)
+        for shape in StatusShape.allCases {
+            #expect(help.contains(shape.rawValue), "--shape help should list \(shape.rawValue), got: \(help)")
+        }
     }
 
     @Test func sessionStatusWithPane() throws {
@@ -554,7 +662,6 @@ struct CommandsTests {
     }
 
     @Test func sessionStatusRejectsBadPane() {
-        // `other` is a session.focus mode, not a status pane — status accepts left|right|scratch only.
         #expect(validationMessage(["session", "status", "blocked", "--pane", "other"]) == "--pane must be left, right, or scratch")
     }
 
@@ -565,7 +672,6 @@ struct CommandsTests {
     }
 
     @Test func sessionRestoreCarriesShellLineVerbatim() throws {
-        // the pinned value is a shell line, so metacharacters must reach the wire untouched.
         let line = "cd /tmp && claude --resume abc | tee out"
         let req = try request(["session", "restore", line])
         #expect(req.args?.command == line)
@@ -629,8 +735,7 @@ struct CommandsTests {
     }
 
     @Test func sessionSearchOpensWithoutNeedleOrFlag() throws {
-        // a bare `session search` opens the bar: no needle, no direction (an empty args bag, since the
-        // command always passes a base ControlArgs to withWindow).
+        // the command always passes a base ControlArgs to withWindow, so the bag is empty rather than nil.
         let expected = ControlRequest(cmd: .sessionSearch, target: "active", args: ControlArgs())
         #expect(try request(["session", "search"]) == expected)
     }
@@ -657,12 +762,10 @@ struct CommandsTests {
 
     @Test(arguments: [["--next", "--close"], ["--next", "--prev"], ["--prev", "--close"]])
     func sessionSearchRejectsFlagCombos(_ flags: [String]) {
-        // the three navigation flags are mutually exclusive — validate() rejects combining any two.
         #expect(validationMessage(["session", "search"] + flags) == "--next, --prev, and --close are mutually exclusive")
     }
 
     @Test func sessionSearchRejectsNeedleWithClose() {
-        // --close ignores the needle, so the combo is a usage error rather than a silent no-op.
         #expect(validationMessage(["session", "search", "foo", "--close"]) == "--close cannot be combined with a needle")
     }
 
@@ -702,21 +805,18 @@ struct CommandsTests {
     }
 
     @Test func sessionOverlayOpenRejectsBadBackgroundColor() {
-        // validate() rejects a malformed hex at parse time (before any connection).
         #expect(throws: (any Error).self) {
             try Agtermctl.parseAsRoot(["session", "overlay", "open", "cmd", "--background-color", "purple"])
         }
     }
 
     @Test func sessionOverlayOpenWithFollow() throws {
-        // --follow maps to ControlArgs.follow = true; the server selects the target after opening.
         let expected = ControlRequest(cmd: .sessionOverlayOpen, target: "active",
                                       args: ControlArgs(command: "revdiff", follow: true))
         #expect(try request(["session", "overlay", "open", "revdiff", "--follow"]) == expected)
     }
 
     @Test func sessionOverlayOpenWithoutFollow() throws {
-        // omitting --follow leaves follow nil (omitted-when-nil on the wire = the no-switch default).
         let expected = ControlRequest(cmd: .sessionOverlayOpen, target: "active", args: ControlArgs(command: "revdiff"))
         let built = try request(["session", "overlay", "open", "revdiff"])
         #expect(built == expected)
@@ -724,7 +824,6 @@ struct CommandsTests {
     }
 
     @Test func sessionOverlayOpenFollowWithBlockAndSizePercentAndTarget() throws {
-        // --follow composes with --block, --size-percent, and --target; follow rides through makeRequest.
         let expected = ControlRequest(cmd: .sessionOverlayOpen, target: "9f3c",
                                       args: ControlArgs(command: "htop", sizePercent: 60, follow: true))
         #expect(try request(["session", "overlay", "open", "htop", "--follow", "--block",
@@ -742,7 +841,6 @@ struct CommandsTests {
     }
 
     @Test func sessionOverlayOpenWithBlockAndSizePercentParses() throws {
-        // --block composes with --size-percent; the block run() opens via makeRequest, so sizePercent rides through.
         let expected = ControlRequest(cmd: .sessionOverlayOpen, target: "active",
                                       args: ControlArgs(command: "htop", sizePercent: 60))
         #expect(try request(["session", "overlay", "open", "htop", "--block", "--size-percent", "60"]) == expected)
@@ -764,7 +862,6 @@ struct CommandsTests {
     }
 
     @Test func sessionOverlayResizeRejectsBadArgs() {
-        // validate() enforces exactly-one-of --size-percent/--full and the 1...100 range at parse time.
         #expect(throws: (any Error).self) { try Agtermctl.parseAsRoot(["session", "overlay", "resize"]) }
         #expect(throws: (any Error).self) {
             try Agtermctl.parseAsRoot(["session", "overlay", "resize", "--full", "--size-percent", "50"])
@@ -774,10 +871,282 @@ struct CommandsTests {
     }
 
     @Test func sessionOverlayBlockRejectsWait() {
-        // validate() enforces the mutually-exclusive flags at parse time (before any connection).
         #expect(throws: (any Error).self) {
             try Agtermctl.parseAsRoot(["session", "overlay", "open", "cmd", "--block", "--wait"])
         }
+    }
+
+    @Test func sessionOverlayOpenWithPane() throws {
+        let left = ControlRequest(cmd: .sessionOverlayOpen, target: "active",
+                                  args: ControlArgs(command: "revdiff", pane: "left"))
+        #expect(try request(["session", "overlay", "open", "revdiff", "--pane", "left"]) == left)
+        let right = ControlRequest(cmd: .sessionOverlayOpen, target: "9f3c",
+                                   args: ControlArgs(command: "htop", pane: "right"))
+        #expect(try request(["session", "overlay", "open", "htop", "--pane", "right", "--target", "9f3c"]) == right)
+        #expect(try request(["session", "overlay", "open", "revdiff", "--pane", "top"]).args?.pane == "top")
+        #expect(try request(["session", "overlay", "open", "revdiff", "--pane", "bottom"]).args?.pane == "bottom")
+        #expect(try request(["session", "overlay", "open", "revdiff", "--pane", "primary"]).args?.pane == "primary")
+        #expect(try request(["session", "overlay", "open", "revdiff", "--pane", "split"]).args?.pane == "split")
+    }
+
+    @Test func sessionOverlayOpenPaneWithTheOtherFlags() throws {
+        let expected = ControlRequest(cmd: .sessionOverlayOpen, target: "active",
+                                      args: ControlArgs(cwd: "/b", command: "revdiff", wait: true, follow: true,
+                                                        pane: "right", color: "#2a1a3a"))
+        #expect(try request(["session", "overlay", "open", "revdiff", "--pane", "right", "--cwd", "/b",
+                             "--wait", "--follow", "--background-color", "#2a1a3a"]) == expected)
+    }
+
+    @Test func sessionOverlayOpenWithoutPane() throws {
+        #expect(try request(["session", "overlay", "open", "revdiff"]).args?.pane == nil)
+    }
+
+    @Test func sessionOverlayPaneRejectsScratch() {
+        #expect(validationMessage(["session", "overlay", "open", "cmd", "--pane", "scratch"])
+            == "--pane must be left or right")
+        #expect(validationMessage(["session", "overlay", "close", "--pane", "scratch"]) == "--pane must be left or right")
+        #expect(validationMessage(["session", "overlay", "result", "--pane", "scratch"]) == "--pane must be left or right")
+        #expect(validationMessage(["session", "overlay", "copy", "--pane", "scratch"]) == "--pane must be left or right")
+        #expect(validationMessage(["session", "overlay", "text", "--pane", "scratch"]) == "--pane must be left or right")
+        #expect(validationMessage(["session", "overlay", "open", "cmd", "--pane", "middle"]) == "--pane must be left or right")
+    }
+
+    @Test func sessionOverlayCopyWithAndWithoutPane() throws {
+        let expected = ControlRequest(cmd: .sessionOverlayCopy, target: "9f3c", args: ControlArgs(pane: "right"))
+        #expect(try request(["session", "overlay", "copy", "--pane", "right", "--target", "9f3c"]) == expected)
+        #expect(try request(["session", "overlay", "copy"]) == ControlRequest(cmd: .sessionOverlayCopy, target: "active"))
+        #expect(try request(["session", "overlay", "copy", "--pane", "primary"]).args?.pane == "primary")
+    }
+
+    @Test func sessionOverlayTextCarriesExtentAndPane() throws {
+        let expected = ControlRequest(cmd: .sessionOverlayText, target: "9f3c",
+                                      args: ControlArgs(pane: "left", all: true))
+        #expect(try request(["session", "overlay", "text", "--all", "--pane", "left", "--target", "9f3c"]) == expected)
+        #expect(try request(["session", "overlay", "text", "--lines", "20"]).args?.lines == 20)
+        #expect(try request(["session", "overlay", "text"]).args == ControlArgs())
+    }
+
+    @Test func sessionOverlayTextRejectsConflictingAndZeroExtent() {
+        // as with `session text`, ArgumentParser takes a negative `-2` for a flag before validate() runs, so
+        // 0 is the only CLI-reachable non-positive case; the dispatcher covers the rest for a socket client.
+        #expect(validationMessage(["session", "overlay", "text", "--all", "--lines", "5"])
+            == "use either --all or --lines, not both")
+        #expect(validationMessage(["session", "overlay", "text", "--lines", "0"]) == "--lines must be greater than 0")
+    }
+
+    @Test func sessionOverlayOpenRejectsPaneWithSizePercent() {
+        #expect(validationMessage(["session", "overlay", "open", "cmd", "--pane", "left", "--size-percent", "70"])
+            == "--pane cannot be combined with --size-percent (pane overlays are always full)")
+    }
+
+    @Test func sessionOverlayCloseWithPane() throws {
+        let expected = ControlRequest(cmd: .sessionOverlayClose, target: "active", args: ControlArgs(pane: "left"))
+        #expect(try request(["session", "overlay", "close", "--pane", "left"]) == expected)
+        #expect(try request(["session", "overlay", "close"]).args == nil)
+    }
+
+    @Test func sessionOverlayResultWithPane() throws {
+        let expected = ControlRequest(cmd: .sessionOverlayResult, target: "9f3c", args: ControlArgs(pane: "right"))
+        #expect(try request(["session", "overlay", "result", "--pane", "right", "--target", "9f3c"]) == expected)
+        #expect(try request(["session", "overlay", "result"]).args == nil)
+    }
+
+    @Test func sessionOverlayResizeHasNoPaneOption() {
+        #expect(throws: (any Error).self) {
+            try Agtermctl.parseAsRoot(["session", "overlay", "resize", "--full", "--pane", "left"])
+        }
+    }
+
+    @Test func sessionOverlayBlockPollCarriesPane() throws {
+        let parsed = try Agtermctl.parseAsRoot(["session", "overlay", "open", "revdiff", "--block", "--pane", "right"])
+        let open = try #require(parsed as? agtermctlKit.Session.Overlay.Open)
+        #expect(open.resultRequest(id: "9f3c")
+            == ControlRequest(cmd: .sessionOverlayResult, target: "9f3c", args: ControlArgs(pane: "right")))
+    }
+
+    @Test func sessionOverlayBlockPollWithoutPane() throws {
+        let parsed = try Agtermctl.parseAsRoot(["session", "overlay", "open", "revdiff", "--block"])
+        let open = try #require(parsed as? agtermctlKit.Session.Overlay.Open)
+        #expect(open.resultRequest(id: "9f3c") == ControlRequest(cmd: .sessionOverlayResult, target: "9f3c"))
+    }
+
+    @Test func sessionOverlayPaneBlockStillRejectsWait() {
+        #expect(validationMessage(["session", "overlay", "open", "cmd", "--pane", "left", "--block", "--wait"])
+            == "--block cannot be combined with --wait")
+    }
+
+    @Test func sessionHudOpenIsTheDefaultSubcommand() throws {
+        let expected = ControlRequest(cmd: .sessionHudOpen, target: "active",
+                                      args: ControlArgs(message: "gathering options"))
+        #expect(try request(["session", "hud", "gathering options"]) == expected)
+    }
+
+    @Test func sessionHudOpenWithEveryOption() throws {
+        // --background-color maps to ControlArgs.color, as the overlay group does.
+        let expected = ControlRequest(cmd: .sessionHudOpen, target: "9f3c",
+                                      args: ControlArgs(sizePercent: 40, message: "building index",
+                                                        detail: "3 of 12 repos", spinner: "bar", window: "w1",
+                                                        color: "#2a1a3a", position: "top"))
+        #expect(try request(["session", "hud", "building index", "--detail", "3 of 12 repos", "--spinner",
+                             "--position", "top", "--background-color", "#2a1a3a", "--size-percent", "40",
+                             "--target", "9f3c", "--window", "w1"]) == expected)
+    }
+
+    // the bare flag resolves to the default style client-side, so the socket only ever carries a name
+    @Test func sessionHudBareSpinnerFlagSendsTheDefaultStyle() throws {
+        let sent = try request(["session", "hud", "working", "--spinner"]).args?.spinner
+        #expect(sent == HudSpinner.defaultStyle.rawValue)
+    }
+
+    @Test(arguments: HudSpinner.allCases) func sessionHudSpinnerStyleImpliesTheSpinner(style: HudSpinner) throws {
+        let sent = try request(["session", "hud", "working", "--spinner-style", style.rawValue]).args?.spinner
+        #expect(sent == style.rawValue, "--spinner-style must turn the spinner on without --spinner")
+    }
+
+    @Test func sessionHudSpinnerStyleWinsOverTheBareFlag() throws {
+        let sent = try request(["session", "hud", "working", "--spinner",
+                                "--spinner-style", "braille"]).args?.spinner
+        #expect(sent == "braille")
+    }
+
+    @Test func sessionHudWithoutASpinnerSendsNone() throws {
+        #expect(try request(["session", "hud", "working"]).args?.spinner == nil)
+    }
+
+    // `none` is what the read-back reports for a static panel, so the CLI must accept the value `tree` just
+    // handed the caller rather than failing locally on a request the raw socket takes
+    @Test func sessionHudAcceptsTheReadBacksNoneAsNoSpinner() throws {
+        #expect(try request(["session", "hud", "working", "--spinner-style", "none"]).args?.spinner == nil)
+    }
+
+    @Test func sessionHudNoneBeatsABareSpinnerFlag() throws {
+        let sent = try request(["session", "hud", "working", "--spinner", "--spinner-style", "none"]).args?.spinner
+        #expect(sent == nil, "naming a value is the more specific instruction, as a named style is")
+    }
+
+    @Test func sessionHudUpdateStopsTheSpinnerWithNone() throws {
+        #expect(try request(["session", "hud", "update", "done", "--spinner-style", "none"]).args?.spinner == nil)
+    }
+
+    @Test func sessionHudRejectsAnUnknownSpinnerStyleBeforeTheSocket() {
+        #expect(throws: (any Error).self) {
+            try request(["session", "hud", "working", "--spinner-style", "swirl"])
+        }
+    }
+
+    @Test func sessionHudUpdateSwitchesStyleInPlace() throws {
+        let sent = try request(["session", "hud", "update", "still working",
+                                "--spinner-style", "dot"]).args?.spinner
+        #expect(sent == "dot")
+    }
+
+    @Test func sessionHudOpenVerbPostsAMessageNamedLikeASubcommand() throws {
+        let expected = ControlRequest(cmd: .sessionHudOpen, target: "active", args: ControlArgs(message: "close"))
+        #expect(try request(["session", "hud", "open", "close"]) == expected)
+    }
+
+    @Test(arguments: HudPosition.allCases)
+    func sessionHudOpenAcceptsEveryPosition(_ position: HudPosition) throws {
+        let expected = ControlRequest(cmd: .sessionHudOpen, target: "active",
+                                      args: ControlArgs(message: "wait", position: position.rawValue))
+        #expect(try request(["session", "hud", "wait", "--position", position.rawValue]) == expected)
+    }
+
+    @Test func sessionHudOpenOmitsUnsetFlags() throws {
+        let built = try request(["session", "hud", "wait"])
+        #expect(built.args?.spinner == nil)
+        #expect(built.args?.detail == nil)
+        #expect(built.args?.position == nil)
+        #expect(built.args?.sizePercent == nil)
+        #expect(built.args?.color == nil)
+        #expect(built.args?.textColor == nil)
+    }
+
+    /// The CLI must take everything the socket does, so a caller can echo back what `tree` handed him and a
+    /// script written against the original vocabulary keeps parsing.
+    @Test(arguments: ["top", "bottom"])
+    func sessionHudAcceptsTheBarePositionAliases(alias: String) throws {
+        let open = try request(["session", "hud", "wait", "--position", alias])
+        let update = try request(["session", "hud", "update", "wait", "--position", alias])
+        #expect(open.args?.position == alias)
+        #expect(update.args?.position == alias)
+    }
+
+    @Test func sessionHudRejectsBadPosition() {
+        let expected = "position must be one of: \(HudPosition.acceptedNamesPhrase)"
+        #expect(validationMessage(["session", "hud", "wait", "--position", "middle"]) == expected)
+        #expect(validationMessage(["session", "hud", "update", "wait", "--position", "middle"]) == expected)
+    }
+
+    @Test func sessionHudCarriesTextColorOnOpenAndUpdate() throws {
+        let open = try request(["session", "hud", "wait", "--text-color", "#7ec07e"])
+        let update = try request(["session", "hud", "update", "done", "--text-color", "#e0e0e0"])
+        #expect(open.args?.textColor == "#7ec07e")
+        #expect(update.args?.textColor == "#e0e0e0")
+    }
+
+    /// The panel's backing is read once at creation, so only the text half is updatable.
+    @Test func sessionHudUpdateTakesNoBackgroundColor() {
+        #expect(validationMessage(["session", "hud", "update", "done", "--background-color", "#112233"]) != nil)
+    }
+
+    @Test func sessionHudRejectsBadTextColor() {
+        #expect(validationMessage(["session", "hud", "wait", "--text-color", "7ec07"])
+            == "text-color must be a #rrggbb hex value")
+        #expect(validationMessage(["session", "hud", "update", "done", "--text-color", "#gggggg"])
+            == "text-color must be a #rrggbb hex value")
+    }
+
+    @Test func sessionHudRejectsBadSizePercent() {
+        #expect(validationMessage(["session", "hud", "wait", "--size-percent", "0"])
+            == "--size-percent must be between 1 and 100")
+        #expect(validationMessage(["session", "hud", "wait", "--size-percent", "150"])
+            == "--size-percent must be between 1 and 100")
+        #expect(validationMessage(["session", "hud", "update", "wait", "--size-percent", "101"])
+            == "--size-percent must be between 1 and 100")
+    }
+
+    @Test func sessionHudOpenRejectsBadBackgroundColor() {
+        #expect(validationMessage(["session", "hud", "wait", "--background-color", "purple"])
+            == "background-color must be a #rrggbb hex value")
+    }
+
+    @Test func sessionHudOpenRequiresAMessage() {
+        #expect(throws: (any Error).self) { try Agtermctl.parseAsRoot(["session", "hud", "open"]) }
+    }
+
+    @Test func sessionHudUpdate() throws {
+        let expected = ControlRequest(cmd: .sessionHudUpdate, target: "9f3c",
+                                      args: ControlArgs(message: "ready", detail: "12 repos", position: "bottom"))
+        #expect(try request(["session", "hud", "update", "ready", "--detail", "12 repos",
+                             "--position", "bottom", "--target", "9f3c"]) == expected)
+    }
+
+    @Test func sessionHudUpdateWithSpinnerAndSizePercent() throws {
+        let expected = ControlRequest(cmd: .sessionHudUpdate, target: "active",
+                                      args: ControlArgs(sizePercent: 25, message: "still working", spinner: "bar"))
+        #expect(try request(["session", "hud", "update", "still working", "--spinner",
+                             "--size-percent", "25"]) == expected)
+    }
+
+    @Test func sessionHudUpdateRequiresAMessage() {
+        #expect(throws: (any Error).self) { try Agtermctl.parseAsRoot(["session", "hud", "update"]) }
+    }
+
+    @Test func sessionHudUpdateHasNoBackgroundColorOption() {
+        #expect(throws: (any Error).self) {
+            try Agtermctl.parseAsRoot(["session", "hud", "update", "ready", "--background-color", "#2a1a3a"])
+        }
+    }
+
+    @Test func sessionHudClose() throws {
+        #expect(try request(["session", "hud", "close"]) == ControlRequest(cmd: .sessionHudClose, target: "active"))
+        #expect(try request(["session", "hud", "close"]).args == nil)
+    }
+
+    @Test func sessionHudCloseWithTargetAndWindow() throws {
+        let expected = ControlRequest(cmd: .sessionHudClose, target: "9f3c", args: ControlArgs(window: "w1"))
+        #expect(try request(["session", "hud", "close", "--target", "9f3c", "--window", "w1"]) == expected)
     }
 
     @Test func quickDefaultsToggle() throws {
@@ -800,8 +1169,7 @@ struct CommandsTests {
     }
 
     @Test func quickTypeWithoutTextOrStdinThrows() {
-        // "provide TEXT or --stdin" is raised in makeRequest (not validate), so it's reached via request(),
-        // which calls makeRequest, rather than parseAsRoot alone.
+        // the message is raised in makeRequest, not validate, so parseAsRoot alone would not reach it.
         #expect(throws: (any Error).self) { try request(["quick", "type"]) }
     }
 
@@ -842,6 +1210,114 @@ struct CommandsTests {
             ControlRequest(cmd: .surfaceZoom, target: "active", args: ControlArgs(mode: "hide", window: "win")))
     }
 
+    @Test func surfaceCursorDefaultsToActive() throws {
+        #expect(try request(["surface", "cursor"]) ==
+            ControlRequest(cmd: .surfaceCursor, target: "active", args: ControlArgs()))
+    }
+
+    @Test func surfaceCursorTargetsSurfaceIDAndWindow() throws {
+        let id = "surface:5E5B1C5B-75C5-49E6-8806-2C61D8D6BBA9:right"
+
+        #expect(try request(["surface", "cursor", "--target", id, "--window", "win"]) ==
+            ControlRequest(cmd: .surfaceCursor, target: id, args: ControlArgs(window: "win")))
+    }
+
+    // MARK: - pick
+
+    @Test func pickDefaultsToOpen() throws {
+        #expect(try Agtermctl.parseAsRoot(["pick"]) is Pick.Open)
+    }
+
+    @Test func pickOpenSniffsJSONArray() throws {
+        let input = Data("""
+          [
+            {"id":"one","label":"One","subtitle":"First"},
+            {"id":"two","label":"Two"}
+          ]
+        """.utf8)
+
+        #expect(try Pick.Open.parseItems(input) == [
+            ControlPickItem(id: "one", label: "One", subtitle: "First"),
+            ControlPickItem(id: "two", label: "Two")
+        ])
+    }
+
+    @Test func pickOpenSniffsBareLines() throws {
+        #expect(try Pick.Open.parseItems(Data("One\nTwo\n".utf8)) == [
+            ControlPickItem(id: "One", label: "One"),
+            ControlPickItem(id: "Two", label: "Two")
+        ])
+    }
+
+    @Test func pickOpenDropsBlankLines() throws {
+        #expect(try Pick.Open.parseItems(Data("\nOne\n \t \n\nTwo\n".utf8)) == [
+            ControlPickItem(id: "One", label: "One"),
+            ControlPickItem(id: "Two", label: "Two")
+        ])
+    }
+
+    @Test func pickOpenAcceptsEmptyStdinAsNoItems() throws {
+        #expect(try Pick.Open.parseItems(Data()).isEmpty)
+    }
+
+    @Test func pickOpenRejectsMalformedJSON() {
+        #expect(throws: (any Error).self) {
+            try Pick.Open.parseItems(Data("[{\"id\":\"one\"".utf8))
+        }
+    }
+
+    @Test func pickOpenMapsEveryOptionToRequest() throws {
+        let command = try Pick.Open.parse([
+            "--prompt", "Choose one", "--query", "on", "--allow-custom", "--follow",
+            "--window", "w1", "--no-block"
+        ])
+        let items = [ControlPickItem(id: "One", label: "One")]
+        let expected = ControlRequest(
+            cmd: .pickOpen,
+            args: ControlArgs(
+                follow: true, items: items, prompt: "Choose one", query: "on",
+                allowCustom: true, window: "w1"
+            )
+        )
+
+        #expect(try command.makeRequest(input: Data("One\n".utf8)) == expected)
+        #expect(command.noBlock)
+    }
+
+    @Test func pickOpenDefaultsToBlockingWithoutOptionalArgs() throws {
+        let command = try Pick.Open.parse([])
+        let items = [ControlPickItem(id: "One", label: "One")]
+
+        #expect(try command.makeRequest(input: Data("One\n".utf8)) ==
+            ControlRequest(cmd: .pickOpen, args: ControlArgs(items: items)))
+        #expect(!command.noBlock)
+    }
+
+    @Test func pickOpenComposesTheItemlessRenameRequest() throws {
+        let command = try Pick.Open.parse(["--allow-custom", "--query", "old name"])
+
+        #expect(try command.makeRequest(input: Data()) == ControlRequest(
+            cmd: .pickOpen,
+            args: ControlArgs(items: [], query: "old name", allowCustom: true)
+        ))
+    }
+
+    @Test func pickResultMapsIDAndWindow() throws {
+        #expect(try request(["pick", "result", "pick-1", "--window", "w1"]) ==
+            ControlRequest(cmd: .pickResult, target: "pick-1", args: ControlArgs(window: "w1")))
+    }
+
+    @Test func pickCancelMapsIDAndWindow() throws {
+        #expect(try request(["pick", "cancel", "pick-1", "--window", "w1"]) ==
+            ControlRequest(cmd: .pickCancel, target: "pick-1", args: ControlArgs(window: "w1")))
+    }
+
+    @Test func pickOpenHasNoTimeoutOption() {
+        #expect(throws: (any Error).self) {
+            try Agtermctl.parseAsRoot(["pick", "--timeout", "60"])
+        }
+    }
+
     // MARK: - dashboard
 
     @Test func dashboardOpenWithIdsAndFontSize() throws {
@@ -861,6 +1337,26 @@ struct CommandsTests {
 
     @Test func dashboardClose() throws {
         #expect(try request(["dashboard", "--close"]) == ControlRequest(cmd: .dashboard, args: ControlArgs(close: true)))
+    }
+
+    @Test func dashboardForwardsPaneRefsVerbatim() throws {
+        let expected = ControlRequest(cmd: .dashboard, args: ControlArgs(targets: ["s1:left", "s2:right", "s3"]))
+        #expect(try request(["dashboard", "s1:left", "s2:right", "s3"]) == expected)
+    }
+
+    @Test func dashboardForwardsAPaneRefOnActive() throws {
+        let expected = ControlRequest(cmd: .dashboard, args: ControlArgs(targets: ["active:left"]))
+        #expect(try request(["dashboard", "active:left"]) == expected)
+    }
+
+    // grammar is the dispatcher's call, not the CLI's — a bad suffix must still reach the socket
+    @Test func dashboardDoesNotValidatePaneGrammarLocally() throws {
+        let expected = ControlRequest(cmd: .dashboard, args: ControlArgs(targets: ["s1:nope"]))
+        #expect(try request(["dashboard", "s1:nope"]) == expected)
+    }
+
+    @Test func dashboardRejectsMruWithPaneRefs() {
+        #expect(validationMessage(["dashboard", "s1:left", "--mru"]) == "--mru cannot be combined with session ids")
     }
 
     @Test func dashboardRejectsFontSizeWithAutoSize() {
@@ -1000,8 +1496,15 @@ struct CommandsTests {
     }
 
     @Test func keymapReloadRejectsWindowSelector() {
-        // keymap.reload is app-global, so --window is meaningless and must not be accepted.
         #expect(throws: (any Error).self) { try Agtermctl.parseAsRoot(["keymap", "reload", "--window", "w1"]) }
+    }
+
+    @Test func keymapList() throws {
+        #expect(try request(["keymap", "list"]) == ControlRequest(cmd: .keymapList))
+    }
+
+    @Test func keymapListRejectsWindowSelector() {
+        #expect(throws: (any Error).self) { try Agtermctl.parseAsRoot(["keymap", "list", "--window", "w1"]) }
     }
 
     @Test func configReload() throws {
@@ -1009,7 +1512,6 @@ struct CommandsTests {
     }
 
     @Test func configReloadRejectsWindowSelector() {
-        // config.reload is app-global, so --window is meaningless and must not be accepted.
         #expect(throws: (any Error).self) { try Agtermctl.parseAsRoot(["config", "reload", "--window", "w1"]) }
     }
 
@@ -1029,7 +1531,6 @@ struct CommandsTests {
     }
 
     @Test func themeSetOneSlotAlone() throws {
-        // theme.set is per-slot: either side alone is a valid request (the server keeps/seeds the other).
         #expect(try request(["theme", "set", "--light", "Builtin Light"])
             == ControlRequest(cmd: .themeSet, args: ControlArgs(light: "Builtin Light")))
         #expect(try request(["theme", "set", "--dark", "Nord"])
@@ -1040,7 +1541,6 @@ struct CommandsTests {
     }
 
     @Test func themeSetRejectsNamePlusLight() {
-        // a positional NAME plus --light targets the same slot twice — validate() rejects it.
         #expect(throws: (any Error).self) {
             try Agtermctl.parseAsRoot(["theme", "set", "Dracula", "--light", "Builtin Light"])
         }
@@ -1051,7 +1551,6 @@ struct CommandsTests {
     }
 
     @Test func themeRejectsWindowSelector() {
-        // theme is app-global (one settings model), so --window is meaningless and must not be accepted.
         #expect(throws: (any Error).self) { try Agtermctl.parseAsRoot(["theme", "set", "Nord", "--window", "w1"]) }
     }
 
@@ -1063,6 +1562,14 @@ struct CommandsTests {
 
     @Test func windowNewWithoutName() throws {
         #expect(try request(["window", "new"]) == ControlRequest(cmd: .windowNew, args: ControlArgs(name: nil)))
+    }
+
+    @Test func windowNewMinimized() throws {
+        #expect(try request(["window", "new", "Work", "--minimized"])
+            == ControlRequest(cmd: .windowNew, args: ControlArgs(name: "Work", minimized: true)))
+        // omitted rather than false, so an un-flagged create stays byte-identical on the wire
+        #expect(try request(["window", "new", "Work"])
+            == ControlRequest(cmd: .windowNew, args: ControlArgs(name: "Work", minimized: nil)))
     }
 
     @Test func windowList() throws {
@@ -1122,24 +1629,45 @@ struct CommandsTests {
         #expect(try request(["window", "fullscreen"]) == ControlRequest(cmd: .windowFullscreen, target: "active"))
     }
 
+    @Test func windowMinimize() throws {
+        #expect(try request(["window", "minimize", "9f3c", "on"])
+            == ControlRequest(cmd: .windowMinimize, target: "9f3c", args: ControlArgs(mode: "on")))
+        #expect(try request(["window", "minimize", "9f3c", "off"])
+            == ControlRequest(cmd: .windowMinimize, target: "9f3c", args: ControlArgs(mode: "off")))
+    }
+
+    @Test func windowMinimizeDefaultsActiveAndToggle() throws {
+        #expect(try request(["window", "minimize"])
+            == ControlRequest(cmd: .windowMinimize, target: "active", args: ControlArgs(mode: "toggle")))
+    }
+
+    @Test func windowMinimizeBareModeTargetsActive() throws {
+        // both positionals are optional, so a bare mode word would otherwise bind to the id; a window
+        // address is a hex prefix or `active`, never a mode word, so the recovery can't misfire.
+        #expect(try request(["window", "minimize", "on"])
+            == ControlRequest(cmd: .windowMinimize, target: "active", args: ControlArgs(mode: "on")))
+        #expect(try request(["window", "minimize", "toggle"])
+            == ControlRequest(cmd: .windowMinimize, target: "active", args: ControlArgs(mode: "toggle")))
+        // an id that merely looks like a mode word is still an id (hex `0ff`, not the word `off`)
+        #expect(try request(["window", "minimize", "0ff"])
+            == ControlRequest(cmd: .windowMinimize, target: "0ff", args: ControlArgs(mode: "toggle")))
+    }
+
     @Test func windowDeleteDefaultsActive() throws {
         #expect(try request(["window", "delete"]) == ControlRequest(cmd: .windowDelete, target: "active"))
     }
 
     @Test func windowRenameRequiresBothArgsFails() {
-        // rename needs an id AND a name; only one positional must fail to parse.
         #expect(throws: (any Error).self) { try Agtermctl.parseAsRoot(["window", "rename", "9f3c"]) }
     }
 
     @Test func windowCommandsRejectWindowSelector() {
-        // window.* target via the positional id, so --window is meaningless and must not be accepted.
         #expect(throws: (any Error).self) { try Agtermctl.parseAsRoot(["window", "list", "--window", "w1"]) }
         #expect(throws: (any Error).self) { try Agtermctl.parseAsRoot(["window", "select", "9f3c", "--window", "w1"]) }
         #expect(throws: (any Error).self) { try Agtermctl.parseAsRoot(["quick", "--window", "w1"]) }
     }
 
     @Test func windowCommandsKeepSocketAndJSON() throws {
-        // --socket / --json stay available on window.* (they share the connection/print surface).
         let parsed = try Agtermctl.parseAsRoot(["window", "list", "--socket", "/tmp/x.sock", "--json"])
         let command = try #require(parsed as? Window.List)
         #expect(command.options.json)
@@ -1168,12 +1696,10 @@ struct CommandsTests {
     }
 
     @Test func treeWithoutWindowOmitsArgs() throws {
-        // no --window keeps tree in its compact form (args nil), matching the no-window request value.
         #expect(try request(["tree"]) == ControlRequest(cmd: .tree))
     }
 
-    // --window must populate args.window AND leave the command's own args intact (the merge folds it
-    // into the existing bag rather than replacing it).
+    // --window folds into the command's existing args bag rather than replacing it.
 
     @Test func sessionTypeWithWindow() throws {
         let expected = ControlRequest(cmd: .sessionType, target: "active",
@@ -1348,8 +1874,7 @@ struct CommandsTests {
     }
 
     @Test func sessionBackgroundImageRejectsControlCharPath() {
-        // the config-injection vector: a newline in the path would smuggle an extra ghostty key into the
-        // per-surface overlay. Caught CLI-side (matching the server boundary) before any round-trip.
+        // a newline in the path would smuggle an extra ghostty key into the per-surface overlay.
         #expect(validationMessage(["session", "background", "image", "x.png\nclipboard-read = allow\ny.png"]) != nil)
     }
 }

@@ -4,11 +4,19 @@ import agtermCore
 @MainActor
 @discardableResult
 func linuxHeaderToggle(_ header: OpaquePointer?, _ icon: String, _ tooltip: String,
-                       _ callback: @escaping @convention(c) (OpaquePointer?, gpointer?) -> Void) -> OpaquePointer? {
+                       _ callback: @escaping @convention(c) (OpaquePointer?, gpointer?) -> Void,
+                       packStart: Bool = false) -> OpaquePointer? {
     let button = OpaquePointer(gtk_button_new_from_icon_name(icon))
     gtk_widget_set_tooltip_text(W(button), tooltip)
+    // Chrome must never own the keyboard; `can-focus` stays untouched so Tab and screen readers still
+    // reach the button (`.claude/rules/main-loop.md`).
+    gtk_widget_set_focus_on_click(W(button), 0)
     connect(button, "clicked", unsafeBitCast(callback, to: GCallback.self))
-    adw_header_bar_pack_end(header, W(button))
+    if packStart {
+        adw_header_bar_pack_start(header, W(button))
+    } else {
+        adw_header_bar_pack_end(header, W(button))
+    }
     return button
 }
 
@@ -38,7 +46,8 @@ extension AppController {
             .quickTerminal: quickToggleBtn,
             .newWorkspace: footerNewWorkspaceButton,
             .newSession: footerNewSessionButton,
-            .flaggedView: footerFlaggedButton
+            .flaggedView: footerFlaggedButton,
+            .focusFilter: footerFocusFilterButton
         ].compactMapValues { $0 }
     }
 
@@ -46,6 +55,22 @@ extension AppController {
         let page = preferencesPage("Interface", name: .interface, icon: "preferences-desktop-display-symbolic")
         addInterfaceGroup("Title Bar", section: .titleBar, settings: settings, to: page)
         addInterfaceGroup("Sidebar", section: .sidebar, settings: settings, to: page)
+        let behavior = preferencesGroup("Sidebar Behavior")
+        adw_preferences_group_add(
+            cast(behavior),
+            W(preferencesSwitch(
+                "Click a workspace row to expand or collapse",
+                active: settings.workspaceRowClickExpands ?? true,
+                handler: unsafeBitCast(onWorkspaceRowClickExpandsChanged, to: GCallback.self))))
+        adw_preferences_page_add(cast(page), cast(behavior))
+        let windows = preferencesGroup("Multiple Windows")
+        adw_preferences_group_add(
+            cast(windows),
+            W(preferencesSwitch(
+                "Show sidebar only in the active window",
+                active: settings.autoHideSidebarInactiveWindows ?? false,
+                handler: unsafeBitCast(onAutoHideInactiveSidebarsChanged, to: GCallback.self))))
+        adw_preferences_page_add(cast(page), cast(windows))
         return page
     }
 
@@ -73,4 +98,20 @@ extension AppController {
 private let onInterfaceElementChanged: @MainActor @convention(c)
     (OpaquePointer?, OpaquePointer?, gpointer?) -> Void = { row, _, _ in
         MainActor.assumeIsolated { controllerForWidget(row)?.interfaceElementChanged(row) }
+    }
+
+private let onAutoHideInactiveSidebarsChanged: @MainActor @convention(c)
+    (OpaquePointer?, OpaquePointer?, gpointer?) -> Void = { row, _, _ in
+        MainActor.assumeIsolated {
+            controllerForWidget(row)?.setAutoHideInactiveSidebars(
+                adw_switch_row_get_active(row) != 0)
+        }
+    }
+
+private let onWorkspaceRowClickExpandsChanged: @MainActor @convention(c)
+    (OpaquePointer?, OpaquePointer?, gpointer?) -> Void = { row, _, _ in
+        MainActor.assumeIsolated {
+            controllerForWidget(row)?.setWorkspaceRowClickExpands(
+                adw_switch_row_get_active(row) != 0)
+        }
     }

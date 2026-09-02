@@ -1,0 +1,7 @@
+# nested config: hosted app tests get a 2000-line budget; everything else inherits root.
+file_length:
+  warning: 2000
+  error: 2200
+type_body_length:
+  warning: 1800
+  error: 2000

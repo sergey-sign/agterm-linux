@@ -21,15 +21,15 @@ permissions:
   attestations: write
 
 env:
-  UPSTREAM_BASE_TAG: "v0.16.1"
-  UPSTREAM_BASE_COMMIT: "d597d059edb99c69675e74b9f2ba159bdc194cc6"
+  UPSTREAM_BASE_TAG: "v0.24.0"
+  UPSTREAM_BASE_COMMIT: "834b74a7f78de06e1c4f66c5e24eafccd047ec64"
   SWIFTLINT_VERSION: "0.65.0"
   SWIFTLINT_SHA256: "79306a34e5c7cc55a220cd108cbb861dcad5f10138dcdf261e2624ae8b0a486b"
   LINUX_SOURCEKIT_LIB_PATH: "/usr/lib/libsourcekitdInProc.so"
-  ZIG_SHA256: "02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239"
+  ZIG_SHA256: "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00"
   NFPM_VERSION: "2.47.0"
   NFPM_SHA256: "0660ca602b2d2d2ae4781a06c692b3eeb9d437ffea05b831d76e41f4a3188783"
-  LINUXDEPLOY_SHA256: "e87ee0815d109282fdda73e34c2361d64d02b0ffaea3674b18f1fd1f6a687dcf"
+  LINUXDEPLOY_SHA256: "421ca71d5c69ea97c6309276232990d43df1dcece0edfaa26bbf926ff96ed12e"
   LINUXDEPLOY_GTK_COMMIT: "7a3fbc31a9e5075073ff8790f26effbac5f84453"
   LINUXDEPLOY_GTK_SHA256: "b0f4cbc684a0103a9651f0955b635eaea0096b3a66c0f5a2c2aa337960375171"
   APPIMAGE_RUNTIME_SHA256: "1cc49bcf1e2ccd593c379adb17c9f85a36d619088296504de95b1d06215aebbf"
@@ -102,10 +102,10 @@ jobs:
           swift --version
           swiftlint --version
           curl -fsSLo /tmp/zig.tar.xz \
-            https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz
+            https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz
           echo "${ZIG_SHA256}  /tmp/zig.tar.xz" | sha256sum --check
           tar -xJf /tmp/zig.tar.xz -C /opt
-          echo "/opt/zig-x86_64-linux-0.15.2" >> "$GITHUB_PATH"
+          echo "/opt/zig-x86_64-linux-0.16.0" >> "$GITHUB_PATH"
 
       - name: Install Linux packaging tools
         run: |
@@ -151,6 +151,16 @@ jobs:
       - name: Test published-release verifier
         run: scripts/test-published-linux-release.sh
 
+      - name: Test Linux architecture verification
+        run: scripts/test-linux-architecture.sh
+
+      - name: Resolve Linux architecture
+        id: linux-architecture
+        shell: bash
+        run: |
+          source linux/arch.sh
+          echo "host=$HOST_ARCH" >> "$GITHUB_OUTPUT"
+
       - name: Lint Swift sources
         run: swiftlint lint --strict --quiet
 
@@ -159,14 +169,11 @@ jobs:
         uses: actions/cache@v6
         with:
           path: agterm-linux/vendor/ghostty
-          key: libghostty-x86_64-${{ hashFiles('scripts/setup-linux.sh', 'scripts/verify-linux-resources.sh', 'linux/ghostty-resources.env', 'linux/patches/ghostty-embedded-opengl.patch', 'linux/patches/ghostty-embedded-input-handoff.patch', 'linux/patches/ghostty-lib-resources.patch') }}
+          key: libghostty-${{ steps.linux-architecture.outputs.host }}-${{ hashFiles('scripts/setup-linux.sh', 'scripts/verify-linux-vendor-cache.sh', 'scripts/verify-linux-architecture.sh', 'scripts/verify-linux-resources.sh', 'linux/arch.sh', 'linux/ghostty-resources.env', 'linux/patches/ghostty-embedded-opengl.patch', 'linux/patches/ghostty-embedded-input-handoff.patch', 'linux/patches/ghostty-lib-resources.patch') }}
 
       - name: Verify restored libghostty cache
         if: steps.ghostty-cache.outputs.cache-hit == 'true'
-        run: |
-          test -s agterm-linux/vendor/ghostty/lib/libghostty.so
-          test -s agterm-linux/vendor/ghostty/include/ghostty.h
-          scripts/verify-linux-resources.sh agterm-linux/vendor/ghostty/share
+        run: scripts/verify-linux-vendor-cache.sh agterm-linux/vendor/ghostty
 
       - name: Test deterministic Ghostty resources
         run: scripts/test-linux-resources.sh
@@ -174,8 +181,8 @@ jobs:
       - name: Build libghostty
         run: scripts/setup-linux.sh
 
-      - name: Verify built libghostty resources
-        run: scripts/verify-linux-resources.sh agterm-linux/vendor/ghostty/share
+      - name: Verify built libghostty cache
+        run: scripts/verify-linux-vendor-cache.sh agterm-linux/vendor/ghostty
 
       - name: Test Linux package
         working-directory: agterm-linux

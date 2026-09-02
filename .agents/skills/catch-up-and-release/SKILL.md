@@ -112,7 +112,7 @@ For each user-visible capability, audit all applicable surfaces:
 4. Linux-local `agtermctl` arguments and output;
 5. control read-back for mutable state;
 6. unit, CLI, integration, and realistic runtime coverage;
-7. `agterm/Resources/agent-skill/` and user-facing documentation.
+7. `plugins/agterm/skills/agterm/` and user-facing documentation.
 
 Explicitly record why any surface is inapplicable.
 
@@ -123,7 +123,8 @@ Explicitly record why any surface is inapplicable.
 - Copy C strings into Swift-owned values before crossing actors, queues, or callbacks.
 - Keep GUI actions and the control channel synchronized. A state mutation also needs observable read-back.
 - Use native GTK/libadwaita behavior and document real Wayland or toolkit constraints instead of fabricating parity.
-- Update the bundled agent skill whenever commands, arguments, keymaps, or the window/workspace/session/pane model changes.
+- Update the bundled agent skill under `plugins/agterm/skills/agterm/` whenever commands, arguments,
+  keymaps, or the window/workspace/session/pane model changes.
 - Validate maintainer, reviewer, and Copilot suggestions before implementing them. Reproduce the claimed issue and check per-platform types or APIs; do not accept comments merely because they sound plausible.
 - Keep commits narrow and reviewable. Do not mix upstream synchronization, unrelated cleanup, parity features, and release-pipeline fixes when they can be separated.
 

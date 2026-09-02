@@ -1,5 +1,5 @@
 name: agterm-linux
-arch: amd64
+arch: ${AGTERM_PACKAGE_ARCH}
 platform: linux
 version: ${AGTERM_PACKAGE_VERSION}
 version_schema: semver

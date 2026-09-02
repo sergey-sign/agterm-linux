@@ -10,11 +10,13 @@ extension AppController: ControlActions {
         case failure(ControlResponse)
     }
 
-    private func ok(_ id: UUID? = nil) -> ControlResponse {
+    // Internal rather than private: the `window.*` arms live in `ControlActions+AppControllerWindows.swift`
+    // (the family split that keeps this file under the line cap) and share these response shapers.
+    func ok(_ id: UUID? = nil) -> ControlResponse {
         ControlResponse(ok: true, result: ControlResult(id: id?.uuidString))
     }
 
-    private func err(_ message: String) -> ControlResponse {
+    func err(_ message: String) -> ControlResponse {
         ControlResponse(ok: false, error: message)
     }
 
@@ -41,7 +43,7 @@ extension AppController: ControlActions {
         }
     }
 
-    private func resolveWindowResponse(_ target: String?) -> ResolveResponse<UUID> {
+    func resolveWindowResponse(_ target: String?) -> ResolveResponse<UUID> {
         let candidates = library.windows.map(\.id)
         switch ControlResolve.resolve(target ?? "active", candidates: candidates, active: library.activeWindowID) {
         case .resolved(let id): return .success(id)
@@ -120,8 +122,8 @@ extension AppController: ControlActions {
         if let name = options.workspaceName {
             guard let needle = name.linuxTrimmedOrNil else { return err("workspace name must not be blank") }
             if options.createWorkspace == true {
-                workspaceID = store.ensureWorkspace(named: needle, clearFocus: !options.noSelect)?.id
-                    ?? store.addWorkspace(name: needle, clearFocus: !options.noSelect).id
+                workspaceID = store.ensureWorkspace(named: needle, revealNewWorkspace: !options.noSelect)?.id
+                    ?? store.addWorkspace(name: needle, revealNewWorkspace: !options.noSelect).id
             } else if let workspace = store.workspace(named: needle) {
                 workspaceID = workspace.id
             } else {
@@ -187,7 +189,7 @@ extension AppController: ControlActions {
             let affected: Int
             if linuxSettingsStore().load().closeGraceUndoEnabled ?? true {
                 affected = store.softCloseSessions(ids) ? ids.count : 0
-                if affected > 0 { reconcileSoftClose(preserving: ids) }
+                if affected > 0 { reconcileSoftClose() }
             } else {
                 affected = ids.reduce(into: 0) { count, id in
                     guard store.session(withID: id) != nil else { return }
@@ -236,6 +238,13 @@ extension AppController: ControlActions {
             }
             return ok(id)
         }
+    }
+
+    func goWorkspace(window: String?, direction: WorkspaceNavigation) -> ControlResponse {
+        guard let step = navigateWorkspace(direction, userInitiated: false) else {
+            return err("no other workspace to navigate to")
+        }
+        return ok(step.workspaceID)
     }
 
     func renameWorkspace(_ target: String?, window: String?, name: String) -> ControlResponse {
@@ -333,23 +342,26 @@ extension AppController: ControlActions {
         case .failure(let response): return response
         case .success(let id):
             store.reorderWorkspace(id, direction)
-            rebuildSidebar()
+            rebuildSidebarKeepingKeyboard()
             syncSidebarSelection()
             return ok(id)
         }
     }
 
-    func focusWorkspace(_ target: String?, window: String?, mode: String?) -> ControlResponse {
+    func focusWorkspace(_ target: String?, window: String?, mode: ControlWorkspaceFocusMode) -> ControlResponse {
         switch resolveWorkspaceResponse(target) {
         case .failure(let response): return response
         case .success(let id):
-            guard let parsed = ControlToggleMode.parse(mode) else {
-                return err("invalid workspace.focus mode: \(mode ?? "toggle")")
-            }
-            let want = parsed.desiredValue(current: store.focusedWorkspaceID == id)
-            focusWorkspace(want ? id : nil)
+            store.applyFocusMode(mode, to: id)
+            rebuildSidebarKeepingKeyboard()
             return ok(id)
         }
+    }
+
+    func setWorkspaceFilter(window: String?, mode: ControlToggleMode) -> ControlResponse {
+        store.applyWorkspaceFilter(mode)
+        rebuildSidebarKeepingKeyboard()
+        return ok()
     }
 
     func setSessionFlag(_ target: String?, window: String?, mode: String?) -> ControlResponse {
@@ -363,7 +375,7 @@ extension AppController: ControlActions {
             guard let parsed = ControlToggleMode.parse(mode) else { return err("invalid flag mode: \(mode ?? "toggle")") }
             let current = store.session(withID: id)?.flagged ?? false
             store.setFlag(parsed.desiredValue(current: current), forSession: id)
-            rebuildSidebar()
+            rebuildSidebarKeepingKeyboard()
             return ok(id)
         }
     }
@@ -373,7 +385,7 @@ extension AppController: ControlActions {
         case .failure(let response): return response
         case .success(let id):
             store.clearUnseen(id)
-            rebuildSidebar()
+            rebuildSidebarKeepingKeyboard()
             return ok(id)
         }
     }
@@ -395,23 +407,46 @@ extension AppController: ControlActions {
             if let sound = update.status.effectiveSound(perCall: update.sound, blockedDefault: blockedDefault) {
                 StatusSoundPlayer.shared.play(sound)
             }
-            rebuildSidebar()
+            rebuildSidebarKeepingKeyboard()
             updateAttentionButton()
             return ok(id)
         }
     }
 
     func splitSession(_ target: String?, window: String?, mode: String?) -> ControlResponse {
+        splitSession(target, window: window, mode: mode, axis: nil)
+    }
+
+    func splitSession(_ target: String?, window: String?, mode: String?, axis: SplitAxis?) -> ControlResponse {
+        switch resolveSessionResponse(target) {
+        case .failure(let response): return response
+        case .success(let id):
+            guard store.session(withID: id) != nil else { return err("no such session") }
+            guard let parsed = ControlToggleMode.parse(mode) else { return err("invalid split mode: \(mode ?? "toggle")") }
+            switch parsed {
+            case .on: store.setSplitVisibility(id, shown: true, axis: axis)
+            case .off: store.setSplitVisibility(id, shown: false)
+            case .toggle: store.toggleSplit(id, axis: axis)
+            }
+            reconcile(rebuildSidebar: false)
+            if store.selectedSessionID == id {
+                sessionFocusTarget(for: id)?.grabFocus(supersedingPopoverCapture: true)
+            }
+            return ok(id)
+        }
+    }
+
+    func closeSessionSplit(_ target: String?, window: String?) -> ControlResponse {
         switch resolveSessionResponse(target) {
         case .failure(let response): return response
         case .success(let id):
             guard let session = store.session(withID: id) else { return err("no such session") }
-            guard let parsed = ControlToggleMode.parse(mode) else { return err("invalid split mode: \(mode ?? "toggle")") }
-            if parsed.desiredValue(current: session.isSplit) != session.isSplit {
-                store.toggleSplit(id)
-            }
+            guard session.hasSplit else { return ok(id) }
+            store.closeSplit(id)
             reconcile()
-            focusedSurface(for: id)?.grabFocus()
+            if store.selectedSessionID == id {
+                sessionFocusTarget(for: id, wantSplit: false)?.grabFocus(supersedingPopoverCapture: true)
+            }
             return ok(id)
         }
     }
@@ -444,7 +479,10 @@ extension AppController: ControlActions {
             syncSplit(session)
             rebuildSidebar()
             updateTitle()
-            (toSplit ? splitSurfaces[id] : surfaces[id])?.grabFocus()
+            if store.selectedSessionID == id {
+                sessionFocusTarget(for: id, wantSplit: toSplit)?
+                    .grabFocus(supersedingPopoverCapture: true)
+            }
             return ok(id)
         }
     }
@@ -462,8 +500,12 @@ extension AppController: ControlActions {
             }
             _ = store.applySplitRatio(ratio, forSession: id)
             if let paned = sessionPanes[id] {
-                let width = max(1, gtk_widget_get_width(W(paned)))
-                gtk_paned_set_position(paned, Int32(Double(width) * (session.splitRatio ?? AppStore.splitRatioDefault)))
+                let extent = session.splitAxis == .topBottom
+                    ? gtk_widget_get_height(W(paned)) : gtk_widget_get_width(W(paned))
+                gtk_paned_set_position(
+                    paned,
+                    Int32(Double(max(1, extent)) * (session.splitRatio ?? AppStore.splitRatioDefault))
+                )
             }
             return ok(id)
         }
@@ -475,7 +517,7 @@ extension AppController: ControlActions {
         if raw == "active" {
             if mode == .off, terminalZoom.target == nil { return ok() }
             resolved = terminalZoom.target
-                ?? TerminalZoomController.resolveTarget(store: store, quickTerminalVisible: quickVisible)
+                ?? (quickVisible ? .quick : TerminalZoomController.resolveTarget(store: store))
         } else if raw == "quick" {
             resolved = .quick
         } else if let surfaceID = TerminalSurfaceID(rawValue: raw) {
@@ -485,8 +527,7 @@ extension AppController: ControlActions {
         }
         if mode == .off, resolved == nil { return ok() }
         guard let resolved else { return err("no active surface") }
-        if mode != .off,
-           !TerminalZoomController.isTargetValid(resolved, in: store, quickTerminalVisible: quickVisible) {
+        if mode != .off, !linuxZoomTargetIsValid(resolved) {
             return err("surface not available: \(resolved.controlID)")
         }
         setTerminalZoom(mode, target: resolved)
@@ -506,19 +547,21 @@ extension AppController: ControlActions {
             guard !members.isEmpty else { return err("no recent sessions") }
         } else {
             let candidates = store.workspaces.flatMap { $0.sessions.map(\.id) }
-            var ids: [UUID] = []
-            var seen = Set<UUID>()
+            var resolved: [ResolvedDashboardTarget] = []
             var unresolved: [String] = []
             for target in targets {
-                if case .resolved(let id) = ControlResolve.resolve(target, candidates: candidates,
-                                                                   active: store.selectedSessionID) {
-                    if seen.insert(id).inserted { ids.append(id) }
-                } else {
+                guard let parsed = DashboardTarget(rawValue: target),
+                      case .resolved(let id) = ControlResolve.resolve(parsed.head, candidates: candidates,
+                                                                      active: store.selectedSessionID),
+                      let session = store.session(withID: id),
+                      parsed.pane != .split || session.hasSplit else {
                     unresolved.append(target)
+                    continue
                 }
+                resolved.append(ResolvedDashboardTarget(session: id, pane: parsed.pane))
             }
-            guard !ids.isEmpty else { return err("no dashboard sessions resolved") }
-            let expanded = store.dashboardMembers(for: ids, limit: DashboardLayout.maxCells)
+            let expanded = store.dashboardMembers(for: resolved, limit: DashboardLayout.maxCells)
+            guard !expanded.members.isEmpty else { return err("no dashboard sessions resolved") }
             members = expanded.members
             if !unresolved.isEmpty { notes.append("unresolved: \(unresolved.joined(separator: ", "))") }
             if expanded.dropped > 0 {
@@ -556,8 +599,14 @@ extension AppController: ControlActions {
     }
 
     func reloadKeymap() -> ControlResponse {
-        let diagnostics = reloadKeymapDiagnostics()
+        let diagnostics = reloadKeymapAllWindows(reportingIn: self)   // app-global: MUST fan out
         return ControlResponse(ok: true, result: ControlResult(count: diagnostics))
+    }
+
+    func listKeymap() -> ControlResponse {
+        let path = ConfigPaths.keymapPath(configDirectory: configDirectory()).path
+        let projected = projectLinuxKeymap(keymap, diagnostics: keymapDiagnostics, path: path)
+        return ControlResponse(ok: true, result: ControlResult(keymap: projected))
     }
 
     func reloadGhosttyConfig() -> ControlResponse {
@@ -580,7 +629,7 @@ extension AppController: ControlActions {
                                                                             title: title ?? "", body: body,
                                                                             firingIsFocused: false,
                                                                             appActive: false))
-            rebuildSidebar()
+            rebuildSidebarKeepingKeyboard()
         }
         let notificationTarget = id.map { TerminalNotification.identity(windowID: windowID, sessionID: $0, pane: .main) }
         if NotificationManager.bannersEnabled {
@@ -656,7 +705,7 @@ extension AppController: ControlActions {
         case .toggle: want = store.sidebarMode == .tree ? .flagged : .tree
         }
         store.setSidebarMode(want)
-        rebuildSidebar()
+        rebuildSidebarKeepingKeyboard()
         syncSidebarSelection()
         return ok()
     }
@@ -687,8 +736,7 @@ extension AppController: ControlActions {
         guard quickSurface != nil || quickVisible else { return err("quick terminal not open") }
         for _ in 0..<12 {
             while g_main_context_iteration(nil, 0) != 0 {}
-            if let quickSurface {
-                quickSurface.inject(text: text)
+            if let quickSurface, quickSurface.inject(text: text) {
                 return ok()
             }
             usleep(30_000)
@@ -720,6 +768,14 @@ extension AppController: ControlActions {
         switch resolveSessionResponse(target) {
         case .failure(let response): return response
         case .success(let id):
+            guard let session = store.session(withID: id) else { return err("session not found") }
+            switch options.pane {
+            case nil, "left": break
+            case "right" where !session.hasSplit: return err("session has no split pane")
+            case "scratch" where session.scratchSurface == nil: return err("session has no scratch terminal")
+            case "right", "scratch": break
+            case .some(let pane): return err("invalid pane: \(pane)")
+            }
             if options.select {
                 selectSession(id, userInitiated: false)
                 reconcile()
@@ -732,8 +788,7 @@ extension AppController: ControlActions {
                 case "scratch": scratchSurfaces[id]
                 case .some: nil
                 }
-                if let surface {
-                    surface.inject(text: options.text)
+                if let surface, surface.inject(text: options.text) {
                     return ok(id)
                 }
                 usleep(30_000)
@@ -765,7 +820,7 @@ extension AppController: ControlActions {
         switch resolveSessionResponse(target) {
         case .failure(let response): return response
         case .success(let id):
-            guard let surface = focusedSurface(for: id) else {
+            guard let surface = focusedSurface(for: id), surface.isRealized else {
                 return err("session not realized")
             }
             surface.performBindingAction(action)
@@ -783,7 +838,14 @@ extension AppController: ControlActions {
                 return ok(id)
             }
             selectSession(id, userInitiated: false)
-            guard let owner = searchTargetSurface(for: id) else { return err("session not realized") }
+            reconcile(focusActive: false)
+            var owner = searchTargetSurface(for: id)
+            for _ in 0..<12 where owner?.isRealized != true {
+                while g_main_context_iteration(nil, 0) != 0 {}
+                usleep(30_000)
+                owner = searchTargetSurface(for: id)
+            }
+            guard let owner, owner.isRealized else { return err("session not realized") }
             searchSurface = owner
             owner.startSearch()
             let hasQuery = text.map { !$0.isEmpty } ?? false
@@ -817,6 +879,18 @@ extension AppController: ControlActions {
         switch resolveSessionResponse(target) {
         case .failure(let response): return response
         case .success(let id):
+            if let pane = options.pane {
+                switch store.openPaneOverlay(id, pane: pane, command: options.command, cwd: options.cwd,
+                                             wait: options.wait, backgroundColor: options.backgroundColor) {
+                case nil:
+                    if options.follow { selectSession(id, userInitiated: false) }
+                    reconcile()
+                    return ok(id)
+                case .unknownSession: return err("no such session")
+                case .alreadyOpen: return err(PaneOverlayError.alreadyOpen)
+                case .paneNotVisible: return err(PaneOverlayError.paneNotVisible)
+                }
+            }
             guard store.openOverlay(id, command: options.command, cwd: options.cwd, wait: options.wait,
                                     sizePercent: options.sizePercent,
                                     backgroundColor: options.backgroundColor) else {
@@ -828,12 +902,14 @@ extension AppController: ControlActions {
         }
     }
 
-    func closeSessionOverlay(_ target: String?, window: String?) -> ControlResponse {
+    func closeSessionOverlay(_ target: String?, window: String?, pane: OverlayPane?) -> ControlResponse {
         switch resolveSessionResponse(target) {
         case .failure(let response): return response
         case .success(let id):
-            guard store.closeOverlay(id) else { return err("no overlay") }
-            reconcile()
+            let hud = pane == nil && store.session(withID: id)?.hudActive == true
+            let closed = pane.map { store.closePaneOverlay(id, pane: $0) } ?? store.closeOverlay(id)
+            guard closed else { return err("no overlay") }
+            reconcile(focusActive: !hud)
             return ok(id)
         }
     }
@@ -842,17 +918,31 @@ extension AppController: ControlActions {
         switch resolveSessionResponse(target) {
         case .failure(let response): return response
         case .success(let id):
+            guard let session = store.session(withID: id) else { return err("no such session") }
+            let hud = session.hudActive
+            if hud, sizePercent == nil { return err(OverlayHudError.fullResize) }
+            let previousSize = session.overlaySizePercent
             guard store.resizeOverlay(id, sizePercent: sizePercent) else { return err("no overlay") }
-            reconcile()
+            if hud, !writeHudBody(session, pane: hudPaneMetrics(for: session)) {
+                store.resizeOverlay(id, sizePercent: previousSize)
+                return err(OverlayHudError.writeFailed)
+            }
+            reconcile(focusActive: !hud)
             return ok(id)
         }
     }
 
-    func sessionOverlayResult(_ target: String?, window: String?) -> ControlResponse {
+    func sessionOverlayResult(_ target: String?, window: String?, pane: OverlayPane?) -> ControlResponse {
         switch resolveSessionResponse(target) {
         case .failure(let response): return response
         case .success(let id):
             guard let session = store.session(withID: id) else { return err("no such session") }
+            if let pane {
+                if session.paneOverlay(pane) != nil { return err(OverlayResultError.stillRunning) }
+                guard let code = session.paneOverlayExitCode(pane) else { return err(OverlayResultError.noResult) }
+                return ControlResponse(ok: true, result: ControlResult(id: id.uuidString, exitCode: code))
+            }
+            if session.hudActive { return err(OverlayHudError.noResult) }
             if session.overlayActive { return err(OverlayResultError.stillRunning) }
             guard let code = session.overlayExitCode else { return err(OverlayResultError.noResult) }
             return ControlResponse(ok: true, result: ControlResult(id: id.uuidString, exitCode: code))
@@ -876,7 +966,7 @@ extension AppController: ControlActions {
         case .success(let id):
             let surface: GhosttySurface?
             switch options.pane {
-            case nil: surface = searchTargetSurface(for: id)
+            case nil: surface = store.session(withID: id)?.onScreenSurface as? GhosttySurface
             case "left": surface = surfaces[id]
             case "right": surface = splitSurfaces[id]
             case "scratch": surface = scratchSurfaces[id]
@@ -889,109 +979,12 @@ extension AppController: ControlActions {
         }
     }
 
-    func windowNew(name: String?) -> ControlResponse {
-        let info = library.newWindow(name: name?.linuxTrimmedOrNil)
-        openWindow(info.id)
-        return ok(info.id)
-    }
-
-    func windowList() -> ControlResponse {
-        let nodes = projectingLinuxAutoFollow(library.controlWindowNodes(flags: { id in
-            guard let ctl = gWindows[id] else { return nil }
-            return (fullscreen: gtk_window_is_fullscreen(WIN(ctl.windowPointer)) != 0,
-                    zoomed: gtk_window_is_maximized(WIN(ctl.windowPointer)) != 0)
-        }))
-        return ControlResponse(ok: true, result: ControlResult(windows: nodes))
-    }
-
-    func windowSelect(_ target: String?) async -> ControlResponse {
-        switch resolveWindowResponse(target) {
-        case .failure(let response): return response
-        case .success(let id):
-            openWindow(id)
-            return ok(id)
-        }
-    }
-
-    func windowClose(_ target: String?) async -> ControlResponse {
-        switch resolveWindowResponse(target) {
-        case .failure(let response): return response
-        case .success(let id):
-            if let ctl = gWindows[id] {
-                gtk_window_close(WIN(ctl.windowPointer))
-            } else {
-                library.closeWindow(id)
-            }
-            return ok(id)
-        }
-    }
-
-    func windowRename(_ target: String?, name: String) -> ControlResponse {
-        switch resolveWindowResponse(target) {
-        case .failure(let response): return response
-        case .success(let id):
-            library.renameWindow(id, to: name)
-            gWindows[id]?.updateTitle()
-            return ok(id)
-        }
-    }
-
-    func windowDelete(_ target: String?) -> ControlResponse {
-        switch resolveWindowResponse(target) {
-        case .failure(let response): return response
-        case .success(let id):
-            guard library.canRemoveWindow else { return err("cannot delete last window") }
-            if let ctl = gWindows[id] {
-                gtk_window_close(WIN(ctl.windowPointer))
-            }
-            library.removeWindow(id)
-            return ok(id)
-        }
-    }
-
-    func windowResize(_ target: String?, width: Int, height: Int) -> ControlResponse {
-        switch resolveWindowResponse(target) {
-        case .failure(let response): return response
-        case .success(let id):
-            guard let ctl = gWindows[id] else { return err("window not open — window.select it first") }
-            gtk_window_set_default_size(WIN(ctl.windowPointer), Int32(width), Int32(height))
-            return ok(id)
-        }
-    }
-
-    func windowMove(_ target: String?, x: Int, y: Int, display: Int?) -> ControlResponse {
-        err("window.move is not supported on this platform (the compositor controls window position)")
-    }
-
-    func windowZoom(_ target: String?) -> ControlResponse {
-        switch resolveWindowResponse(target) {
-        case .failure(let response): return response
-        case .success(let id):
-            guard let ctl = gWindows[id] else { return err("window not open — window.select it first") }
-            if gtk_window_is_maximized(WIN(ctl.windowPointer)) != 0 {
-                gtk_window_unmaximize(WIN(ctl.windowPointer))
-            } else {
-                gtk_window_maximize(WIN(ctl.windowPointer))
-            }
-            return ok(id)
-        }
-    }
-
-    func windowFullscreen(_ target: String?) -> ControlResponse {
-        switch resolveWindowResponse(target) {
-        case .failure(let response): return response
-        case .success(let id):
-            guard let ctl = gWindows[id] else { return err("window not open — window.select it first") }
-            ctl.requestWindowFullscreenToggle()
-            return ok(id)
-        }
-    }
-
     func clearRestoreCommands() -> ControlResponse {
         for ctl in gWindows.values {
             for session in ctl.store.workspaces.flatMap(\.sessions) {
                 session.foregroundCommand = nil
                 session.splitForegroundCommand = nil
+                session.clearPendingForegroundCommands()
             }
         }
         gLibrary.saveAllOpen()

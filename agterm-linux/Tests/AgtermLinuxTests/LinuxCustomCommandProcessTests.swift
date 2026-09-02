@@ -28,6 +28,44 @@ struct LinuxCustomCommandProcessTests {
             #expect(request.environment["AGT_SELECTION"] == "selected")
             #expect(request.currentDirectoryPath == "/tmp/work")
             #expect(request.standardIO == .null)
+            #expect(request.environment["PATH"]?.contains("/.local/bin") == true)
+        }
+    }
+
+    @Test("custom command PATH is Linux-native, bundled-first, stable, and deduplicated")
+    func commandPath() {
+        let path = LinuxCommandPath.widened(
+            "/custom/bin:/usr/bin:/custom/bin", bundledCLIDirectory: "/app/bin",
+            homeDirectory: "/home/test")
+        #expect(path.split(separator: ":").map(String.init) == [
+            "/app/bin", "/custom/bin", "/usr/bin", "/home/test/.local/bin",
+            "/usr/local/bin", "/bin", "/usr/local/sbin", "/usr/sbin", "/sbin"
+        ])
+        #expect(!path.contains("homebrew"))
+    }
+
+    @Test("bundled CLI directory requires the resolved absolute executable path")
+    func bundledCLIPath() {
+        #expect(LinuxCommandPath.resolvedExecutableDirectory("agterm-linux") == nil)
+        #expect(LinuxCommandPath.resolvedExecutableDirectory("/opt/agterm/bin/agterm-linux.bin")
+                == "/opt/agterm/bin")
+        #expect(LinuxCommandPath.bundledCLIDirectory?.hasPrefix("/") == true)
+    }
+
+    /// The restore lives in `request`, not in `launch`'s default argument, so a caller that supplies its
+    /// own base environment cannot opt out of it. Driven off `gdkEnvironment` itself rather than a
+    /// literal, because which variable this GTK build assigns — and therefore restores — is a runtime
+    /// fact; the values are pinned from literals in `LinuxGdkPreLaunchEnvironmentTests`.
+    @Test("the request restores the pre-launch GDK environment over a caller's own base")
+    func requestRestoresGdkEnvironment() {
+        let poisoned = gdkEnvironment.childRestore.keys.reduce(into: [String: String]()) { base, name in
+            base[name] = "leaked-from-agterm"
+        }
+        let request = LinuxCustomCommandProcess.request(
+            command: CustomCommand(name: "noop", command: "true", shortcut: ""),
+            context: CommandContext(), baseEnvironment: poisoned)
+        for (name, restored) in gdkEnvironment.childRestore {
+            #expect(request.environment[name] == restored)
         }
     }
 

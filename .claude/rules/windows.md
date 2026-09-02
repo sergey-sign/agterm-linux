@@ -3,297 +3,228 @@ paths:
   - "agtermCore/Sources/agtermCore/WindowLibrary.swift"
   - "agtermCore/Sources/agtermCore/WindowGeometry.swift"
   - "agtermCore/Sources/agtermCore/QuitPrompt.swift"
+  - "agtermCore/Sources/agtermCore/QuitReason.swift"
   - "agterm/WindowRegistry.swift"
   - "agterm/AppDelegate.swift"
+  - "agterm/AppDelegate+DockMenu.swift"
   - "agterm/Views/WindowAccessor.swift"
   - "agterm/Views/WindowControlArea.swift"
   - "agterm/Views/QuickTerminal.swift"
   - "agtermUITests/MultiWindowUITests.swift"
   - "agtermUITests/QuickTerminalUITests.swift"
+  - "agtermTests/DockMenuTests.swift"
 ---
 
-## Windows (multi-window)
+## Windows
 
-A **window** is the top level above the workspace tree: a named, persisted bundle of workspaces + sessions,
-each rendered in its own on-screen macOS window.
-The user keeps a library of windows (e.g. "work", "personal"), opens one per on-screen window,
-and the set open at quit reopens on next launch.
-Strict 1:1 — a bundle shows in exactly one on-screen window, never two windows for one bundle,
-never two bundles in one window.
-**No** shared/cross-window live state and **no** cross-window session drag (out of scope by the 1:1 model).
+A window is a named, persisted workspace/session bundle rendered in exactly one macOS window. One bundle
+never appears in two windows, and one window never holds two bundles. Shared live state and cross-window
+session drag are out of scope.
 
-- **Model (`agtermCore`, host-free).**
-  `WindowLibrary.swift` holds `WindowInfo {id: UUID, name: String}` (named `WindowInfo`,
-  NOT `Window`, to avoid the SwiftUI/AppKit clash) and the persisted Codables `WindowsIndex {version, frontmost: UUID?, windows: [WindowEntry]}`
-  / `WindowEntry {id, name, isOpen}` (the index carries its OWN `version`,
-  independent of `Snapshot.version`).
-  `WindowLibrary` is `@Observable @MainActor` like `AppStore`: it owns the ordered `windows: [WindowInfo]`,
-  the live per-window `stores: [UUID: AppStore]` (`@ObservationIgnored`),
-  `frontmostWindowID`, and per-window + index persistence.
-  A window is "open" iff its `AppStore` is loaded (`stores[id] != nil`).
-- **`AppStore` stays the per-window unit**
-  — it already is one tree + one selection, so internals are unchanged; `WindowLibrary` just owns one
-  store per open window, lazily loaded.
-  `store(for:)` returns an open window's store; `loadStore(for:)` lazily builds/caches it from `windows/<id>.json`;
-  `newWindow(name:)` seeds a fresh window (one "workspace 1" + one `$HOME` session — the seeding that
-  used to live in the dropped `agtermApp.restoredStore()`); `closeWindow`/`renameWindow`/`removeWindow`
-  (`canRemoveWindow` = count > 1, keep-at-least-one) mutate + persist; `openIDs()` is the persisted open-set
-  for launch reopen.
-- **Persistence layout**
-  under `<stateDir>` (`AGTERM_STATE_DIR`-aware, else `~/Library/Application Support/agterm`):
-  `windows.json` is the index, `windows/<uuid>.json` is each window's `Snapshot` (the same shape `workspaces.json`
-  had), and the legacy `workspaces.json` is left dormant after migration.
-  `PersistenceStore` gained an optional `fileName:` init param (default `workspaces.json`) so a per-window
-  store targets `windows/<id>.json` without breaking existing callers.
-  A per-mutation `saveIndex()` rewrites only `windows.json`; each store's own `save()` rewrites only
-  its file.
-- **Migration + recovery (on `WindowLibrary` init `bootstrap()`; never throws,
-  mirrors `PersistenceStore.load()`):** valid `windows.json` → load it; absent index but legacy `workspaces.json`
-  present → wrap it into one window ("window 1", marked open/frontmost);
-  neither → seed one empty window.
-  A corrupt or `version`-mismatched `windows.json` is treated as absent,
-  but BEFORE the legacy-else-seed fallback `recoverOrphanedWindows()` (run in `bootstrap()` between `loadIndex()`
-  and `migrateLegacy()`) enumerates any `windows/<uuid>.json` files (skipping non-UUID names),
-  appends them ALL to `windows` FIRST (`loadStore` guards on `windows.contains(id)`),
-  default-names them (`window N`), `loadStore`s each, and marks them all open with the first frontmost
-  — so a future index schema bump RECOVERS the user's sessions instead of resurrecting stale `workspaces.json`
-  or seeding empty; only with NO per-window files does the migrate-from-legacy-else-seed path run.
-  A missing/corrupt `windows/<id>.json` opens that window with an empty `Snapshot` (one default workspace
-  + session).
-  Net: the app always reaches a valid, non-empty window set, never windowless at launch.
-- **Scene + restoration — ⚠️ deviates from the planned `WindowGroup(for:)`.**
-  A *value-based* `WindowGroup(for:)` does NOT auto-open any window at launch when SwiftUI window restoration
-  is off (the scene `.task` never runs, so `openWindow(value:)` can't bootstrap).
-  The scene is therefore a **plain `WindowGroup(id: "terminal")`** (auto-opens one window at launch +
-  one per `openWindow(id:)`).
-  `WindowLibrary` is the single source of truth for the open-set; each appearing SwiftUI window claims
-  the next id from a FIFO **claim queue** (`consumeReopen()` seeds it launch-window-first,
-  `claimNextWindowID()` pops, `enqueueClaim(_:)` appends for a brand-new window),
-  and a window beyond the open set (a SwiftUI-restored stray) gets no id and `dismiss()`es itself.
-  **No `.restorationBehavior`:** it is macOS 15+ and `SceneBuilder` rejects `if #available` entirely
-  (verified — `@ViewBuilder` accepts it, `@SceneBuilder` does not, and there is no `AnyScene` eraser),
-  and the deployment floor is macOS 14, so the mechanism is **dedup-by-id only** (claim queue + dismiss-stray),
-  uniform across 14 and 15.
-  `reopenWindows()` in the scene `.task` opens one window per *remaining* open id (SwiftUI auto-opened
-  the first), once via the `hasReopened` latch.
-  `TitleProbeView` sets `frameAutosaveName("agterm-window-<id>")` so AppKit restores geometry per window.
-- **Frontmost-store resolution + quit-flush.**
-  `AppActions` takes the `WindowLibrary`, not a fixed store: its mutating methods resolve `library.activeStore`
-  (the frontmost open store, falling back to the first open store; backed by `activeWindowID`,
-  the same resolution the quick terminal uses) and no-op when nil.
-  The app `.commands` builder and `paletteActions()` build-time reads go through the same accessor —
-  reactive because `WindowLibrary` is `@Observable`.
-  `ControlServer`/`SettingsModel`/`SessionSwitcher` are likewise wired to the library.
-  `TitleProbeView` reports frontmost (`didBecomeKey/Main` → `library.frontmostWindowID` + `saveIndex()`)
-  and close (`willClose` → tear down that window's surfaces + `library.closeWindow`).
-  The quit-flush replaces the dropped single-store `AppDelegate.store.save()`:
-  `applicationWillTerminate` sets `library.isTerminating` (so the per-window `willClose` close-reporting
-  can't zero the open-set as windows tear down on quit) then `library.saveAllOpen()` + `library.saveIndex()`
-  — load-bearing because `AppStore` does NOT save on a live `cd`, so cwd changes since the last structural
-  mutation are flushed here.
-  `selectSession`/`setFontSize` also persist via a debounced `scheduleSave()` (~0.3 s,
-  host-free `Debouncer`) instead of an immediate `save()` — structural mutations (add/close/move/rename/addWorkspace)
-  still `save()` synchronously, and `save()` cancels any pending scheduled save so this quit-flush captures
-  the latest selection/font (same lose-last-change-on-SIGKILL tradeoff as the split-ratio debounce).
-- **Quit confirmation.**
-  `AppDelegate.applicationShouldTerminate` gates a menu/⌘Q quit behind a standard warning `NSAlert` (Quit
-  / Cancel → `.terminateNow`/`.terminateCancel`), reporting how many windows + sessions the quit closes
-  (closing them ends every shell, the same loss `deleteWorkspace`/`deleteActiveWindow` confirm).
-  Counts come from the host-free `WindowLibrary.openCounts()` (open windows + total sessions across them)
-  and the message from the host-free `QuitPrompt.message(windows:sessions:)` (both unit-tested);
-  the AppKit alert is the app-side glue, manually verified like the other `confirmDelete` alerts.
-  Skips the prompt (`.terminateNow`) when nothing is open (the auto-quit after the last window closed
-  — `applicationShouldTerminateAfterLastWindowClosed` already gates that on the model open-set) OR under
-  an XCUITest launch (`ContentView.isUITestLaunch` — a modal would hang the test's terminate;
-  the dialog is therefore manually verified, not XCUITest-covered).
-  `let library else .terminateNow` is a safety fallback: a quit before the scene `.task` wired the library
-  (sub-~4 s after launch) allows termination rather than deadlocking.
-  Keep-in-sync EXEMPT — a quit-confirm modal is GUI-only chrome with nothing to drive over the socket
-  (there is no `app.quit` control command).
-- **`WindowRegistry`**
-  (`agterm/WindowRegistry.swift`, app-side, `@MainActor` singleton) maps a `WindowInfo.ID` to its live `NSWindow`
-  — `WindowLibrary` is host-free (no AppKit), so the NSWindow handles live app-side.
-  `TitleProbeView` registers/unregisters on attach/close; `raise(_:)` brings an already-open window forward
-  (the dedup-by-id raise path), `close(_:)` runs `performClose` (driving the standard `willClose` teardown,
-  used by `window.close`).
-- **Per-window quick terminal.**
-  `QuickTerminalController` is no longer a `static let shared` singleton — it is a per-window instance
-  owned by `WindowContentView` (as `@State`), registered in the app-side `QuickTerminalRegistry` (`Views/QuickTerminal.swift`,
-  `@MainActor` singleton) keyed by `WindowInfo.ID` on appear, unregistered on disappear.
-  Its `cwdProvider`/`envProvider` bind to that window's active session.
-  The frontmost-window call sites resolve via `QuickTerminalRegistry.controller(for: library.activeWindowID)`
-  (the toggle goes through `AppActions.toggleQuickTerminal()`; `ControlServer`'s `quick` arm errors with
-  `no open window` when none is open); the settings broadcast reaches every window's quick terminal via
-  `allControllers()`.
-  Zero `QuickTerminalController.shared` references remain.
-- **Cross-window notification reveal.**
-  The notification identity (`TerminalNotification.identity`/`parseIdentity` in agtermCore) is now `"<windowID>:<sessionID>:<paneRole>"`
-  — the windowID lets a banner clicked after its window closed know which window to reopen.
-  The capture side (`NotificationManager.notify`/`clearDelivered`) resolves the firing window via `library.windowID(forSession:)`.
-  `AppActions.reveal(windowID:sessionID:pane:)` uses `library.store(forSession:)`;
-  if the owning window is closed it reopens it via the `actions.openWindow` closure (`agtermApp` wires
-  it to `WindowRegistry.raise` else `enqueueClaim` + `openWindow(id:)`),
-  polls for the store to load, then `selectSession` + focus the pane (stale-safe:
-  unknown window/session → just activate).
-  `reveal` stays a keep-in-sync exemption (internal click-routing, not on toolbar/menu/palette).
-- **Spawned-shell `AGTERM_*` env (per surface).**
-  `GhosttySurfaceView.init` takes `env: [String: String] = [:]`; it strdups each key/value into the existing
-  `configCStrings` and builds a `nonisolated(unsafe) var envVars: [ghostty_env_var_s]` field set as `config.env_vars`/`config.env_var_count`
-  — the struct array must outlive `ghostty_surface_new` and can't live in `configCStrings` (wrong element
-  type), so `ghostty_surface_new` is called *inside* the `envVars.withUnsafeMutableBufferPointer` closure
-  (no env → plain path) and the array is cleared in `destroySurface`/`deinit` alongside the strdup frees.
-  Tree surfaces (main/split/overlay, via `agtermApp.surfaceEnv(for:)`) inject `AGTERM_ENABLED=1`,
-  `AGTERM_WINDOW_ID` (`library.windowID(forSession:)`), `AGTERM_WORKSPACE_ID` (`store.workspace(forSession:)`),
-  `AGTERM_SESSION_ID`, `AGTERM_SOCKET`; split/overlay inherit the parent session's ids.
-  The quick terminal (`quickTerminalEnv(for:)`) gets only `AGTERM_ENABLED` + `AGTERM_WINDOW_ID` + `AGTERM_SOCKET`
-  (scratch, not in the tree).
-  `AGTERM_SOCKET` is the path `ControlServer` *actually bound* (`ControlServer.boundSocketPath`,
-  nil before bind → the var is omitted), so a test-overridden `AGTERM_CONTROL_SOCKET` and the injected
-  env agree.
-- **`window.zoom` (maximize-to-screen toggle, control + double-click-header GUI).** `WindowRegistry.zoom(_:)`
-  drives the standard `NSWindow.zoom(nil)` — toggles between the normal frame and the screen's visible frame
-  (NOT native fullscreen); a second call restores.
-  Unlike `resize`/`move` it has a GUI surface: a custom-titlebar SwiftUI view can't receive the OS
-  double-click handling, so `WindowControlArea` (an `NSViewRepresentable` behind `customTitlebar`'s decorative
-  regions in `agterm/Views/WindowControlArea.swift`) handles `mouseDown` — `clickCount == 2` runs the user's configured title-bar
-  action, else `performDrag` (also making the FULL header draggable, not just the native top band);
-  `mouseDownCanMoveWindow = false` so our handler sees the double-click.
-  The double-click honors the macOS **Desktop & Dock ▸ "Double-click a window's title bar to"** setting
-  (`AppleActionOnDoubleClick` in `NSGlobalDomain`, read LIVE per click): Zoom/Fill → `window.zoom(nil)`,
-  Minimize → `performMiniaturize`, "Do Nothing" → no-op; the key is absent until the user changes it from the
-  macOS default (Zoom), so an untouched system still zooms (the prior behavior).
-  So the GUI double-click is NOT always-zoom — only the `window.zoom` control command unconditionally zooms.
-  A UITest env override (`AGTERM_UITEST_DOUBLECLICK_ACTION`, read ahead of the system default) pins the action
-  so the gesture tests are hermetic regardless of the host setting; it rides the environment, not launch
-  arguments (FB11763863 — see `ui-tests.md`).
-  The header's decorative parts (the traffic-light spacer, the divider gap, the title text) opt out via
-  `.allowsHitTesting(false)` so their region falls through to the layer; the buttons stay in front.
-  Requires the window OPEN (closed → the `window not open` error), like `resize`/`move`.
-  Its READ side is `ControlWindowNode.zoomed` on `window.list` (via `WindowRegistry.windowFlags(for:)` →
-  `NSWindow.isZoomed`), so a script can toggle idempotently.
-  Four-point keep-in-sync audit: (1) `case windowZoom = "window.zoom"` in `ControlProtocol.swift`,
-  (2) the `.windowZoom` dispatch arm (`windowZoom`) in `ControlServer` → `WindowRegistry.shared.zoom`,
-  (3) the `window zoom <id>` subcommand in `agtermctlKit`, (4) `.windowZoom` in `windowCommandsRoundTrip`
-  (`ControlProtocolTests`) + the e2e `testWindowZoom` plus the gesture tests
-  `testDoubleClickHeaderZoomsAndRestores` / `testDoubleClickHeaderHonorsNoneSetting` /
-  `testHeaderButtonsStillReceiveClicksOverControlArea` / `testDragHeaderMovesWindow` in `ControlWindowUITests`.
-- **`window.fullscreen` (native macOS full screen — control + View-menu / green-button / ⌃⌘F GUI).**
-  `WindowRegistry.fullscreen(_:)` drives the standard `NSWindow.toggleFullScreen(nil)` — enters/exits NATIVE
-  full screen (a separate Space, auto-hidden menu bar); a second call exits.
-  Distinct from `window.zoom`, which only maximizes the frame in the SAME Space.
-  It has a GUI surface across all four keep-in-sync callers: the **View ▸ Toggle Full Screen** menu item and
-  the ⌃⇧P palette "Toggle Full Screen" both drive `AppActions.toggleFullscreen()` →
-  `NSApp.keyWindow?.toggleFullScreen(nil)` (the KEY window, no id resolution — the menu/palette/keymap
-  always act on the frontmost), `BuiltinAction.toggleFullscreen` gives it the ⌃⌘F default (expressible,
-  rebindable via `keymap.conf`), and the green traffic-light button already toggles the same native path.
-  The control command instead resolves a window id like `zoom` (`active`/prefix/id) and requires the window
-  OPEN (closed → the `window not open` error).
-  **AppKit auto-injects its OWN "Enter Full Screen" item (Globe+F / ⌃⌘F) into the View menu for any
-  fullscreen-capable window and RE-INJECTS it every time the menu opens, so agterm's own item would render
-  a DUPLICATE.** `AppDelegate` strips the native one — `removeNativeFullScreenMenuItem` removes the menu item
-  whose action is `toggleFullScreen:` (agterm's item uses a SwiftUI closure action, a different selector, so
-  only the native one matches).
-  It runs once at launch AND on every `NSMenu.didBeginTrackingNotification` (the point AppKit re-injects it) —
-  a launch-time one-shot does NOT stick because of the re-injection; a menu delegate is NOT used (it would
-  clobber SwiftUI's dynamic View-menu updates).
-  Guarded by the e2e `testViewMenuHasSingleFullScreenItem` in `MenuUITests` (View menu shows Toggle Full
-  Screen, NOT the native Enter Full Screen).
-  Its READ side is `ControlWindowNode.fullscreen` on `window.list` (via `WindowRegistry.windowFlags(for:)` →
-  `styleMask.contains(.fullScreen)`), so a script can enter/exit only when needed.
-  Four-point keep-in-sync audit: (1) `case windowFullscreen = "window.fullscreen"` in `ControlProtocol.swift`
-  + `case toggleFullscreen = "toggle_fullscreen"` (⌃⌘F `defaultChord`) in `BuiltinAction`,
-  (2) the `.windowFullscreen` dispatch arm (`windowFullscreen`) in `ControlServer` →
-  `WindowRegistry.shared.fullscreen`, plus `AppActions.toggleFullscreen()`, the View menu item, and
-  `PaletteCommand.toggleFullscreen`,
-  (3) the `window fullscreen <id>` subcommand in `agtermctlKit`, (4) `.windowFullscreen` in
-  `windowCommandsRoundTrip` (`ControlProtocolTests`) +
-  `windowCommandsRouteParsedInputsAndKeepActionResponses` (`ControlDispatcherTests`) + the CLI mapping in
-  `CommandsTests` + the e2e `testWindowFullscreen` in `ControlWindowUITests`.
-- **`window.*` control additions (eight commands, plus `window.zoom`/`window.fullscreen`).**
-  `window.new` (returns the new id + opens its window), `window.list` (returns `windows` with each window's
-  `open`/`active` flag, plus `autoFollowMs` and `sidebarVisible` read from the open window's store, and
-  `geometry` — the live NSWindow frame `{x, y, width, height, display}` in `window.move`/`window.resize`'s
-  own coordinate system (top-left relative to the display, y down) so a read-back round-trips through them,
-  read app-side via `WindowRegistry.geometry(for:)` — plus `fullscreen`/`zoomed` (the read side of
-  `window.fullscreen`/`window.zoom`, read via `WindowRegistry.windowFlags(for:)` so a script can make
-  those toggles idempotent) — all omitted for a closed window),
-  `window.select` (raise-or-open), `window.close` (`WindowRegistry.close` →
-  standard teardown), `window.rename`, `window.delete` (`canRemoveWindow` keep-at-least-one → error,
-  not a GUI confirm).
-  `window.list` is answered from the background-thread `cachedWindowNodes` cache (see the fast-path note
-  above), refreshed after every dispatched command + on `.agtermWindowFrontmostChanged`.
-  `sidebarVisible` is the first frequently-GUI-mutated field on that node, so a GUI-only ⌃⌘S sidebar
-  toggle (no control command, no frontmost change) would otherwise leave it stale — `AppStore.setSidebarVisible`
-  posts `.agtermSidebarVisibilityChanged` and `ControlServer` observes it to `refreshWindowCache`.
-  The live, never-cached copy of `sidebarVisible` is on `tree`'s top level (main-actor per request);
-  prefer it for read-then-act scripts.
-  The node's `geometry`/`fullscreen`/`zoomed` are the SAME problem writ larger — live NSWindow state that a
-  user drag/resize/zoom/fullscreen changes with no command, and (unlike `sidebarVisible`) with NO live tree
-  copy, so a polling `window.list` would read them stale forever. `ControlServer` therefore observes the
-  NSWindow `didMove`/`didResize`/`didEnterFullScreen`/`didExitFullScreen` notifications (object nil) and
-  `refreshWindowCache`s on each — the fullscreen enter/exit fire AFTER the async transition, so the settled
-  `styleMask` is captured; a drag's storm just keeps the cache current.
-  The notification is IGNORED (`_ in`), NOT captured: a non-Sendable `Notification` can't cross into the
-  `MainActor.assumeIsolated` region under Swift 6 (the `sending 'note'` error — which a Debug build compiles
-  clean but the Release WMO rejects, so verify app-target concurrency changes with a Release build), so the
-  refresh can't filter to an agterm window by the notification's object; a non-agterm panel firing it just
-  rebuilds the same cheap agterm nodes.
-  `window.resize` (`args.width`/`height` → the window's frame size in points) and `window.move` (`args.x`/`y`
-  → the top-left relative to display `args.display`, default the window's current display;
-  y from the display top, so multiple displays are addressed by index) drive the app-side `WindowRegistry.resize`/`move`
-  (the NSWindow handles, since `WindowLibrary` is host-free); both require the window OPEN (a closed
-  window errors) and are control-NATIVE (no GUI surface — the native title bar already drags-to-resize).
-  Both CLAMP the request via the host-free `WindowGeometry` (`clampSize` into `[window.minSize, screen.visibleFrame]`,
-  `clampOrigin` keeps a grabbable on-screen strip) applied INSIDE `WindowRegistry` (the only place with
-  the live `NSWindow`/`NSScreen`); `ControlServer` keeps only the `>0` guard.
-  `WindowGeometry` is agtermCore's first CoreGraphics types (CG ≠ AppKit/Metal,
-  Foundation-provided on Darwin).
-  Window-id resolution reuses the pure `ControlResolve.resolve` over `library.windows` (active=frontmost
-  / exact / prefix / ambiguous / not-found); a window need NOT be open to be a `window.*` target.
-  The global `--window <id>` selector (`ControlArgs.window`) targets a session/workspace command at a
-  *specific* window's tree: with `args.window` set, the window must be open (else `window not open — window.select it first`);
-  without it, `active`/placement default to the frontmost store, but an id/prefix session/workspace target
-  is matched across ALL open stores (`resolveTargetAcrossWindows`) and mapped back to its owning `AppStore`.
-  See the Control API section for the catalog and the keep-in-sync four-point audit (all eight window
-  commands satisfy it).
-- **`open -a agterm /path` (the OS "open terminal here" integration — Discussion #230) is WARM-ONLY on purpose.**
-  `AppDelegate.application(_:open:)` resolves each URL to a directory (host-free `OpenPathResolver`:
-  a folder → itself, a file → its parent, nil for a non-file / missing path), queues it in
-  `pendingOpenDirectories`, and `drainPendingOpenDirectories` grafts a session into the last-active window
-  via `AppActions.openSession(atDirectory:)` (which mirrors `newSession()` — note-activity + select +
-  focus — but seeds the cwd from the path and targets `library.activeStore`, the SAME window the control
-  channel's `session.new` defaults to).
-  The drain gates on `library.activeStore?.currentWorkspaceID != nil` and retries on a bounded 0.1 s
-  backoff (dropping the queue after 50 ticks so a stray folder can't wedge a timer); the scene `.task`
-  hands the delegate `actions` and calls the drain once, and `application(_:open:)` calls it inline for
-  the running instance.
-  After a session lands it `WindowRegistry.raise`s `library.activeWindowID` (deminiaturize + make-key) so
-  an "open here" into a MINIMIZED last-active window is actually visible — `NSApp.activate()` alone only
-  brings the app forward and would leave the window in the Dock; a no-op for an already-frontmost window.
-  `CFBundleDocumentTypes`/`LSItemContentTypes = public.folder` (role Viewer) in `Info.plist` is what puts
-  agterm in Finder's right-click **Open With ▸ agterm** for folders; it is NOT required for `open -a`
-  routing (odoc delivers the folder either way) — only for the Finder listing.
-  **The COLD case (agterm NOT running) is deliberately unsupported and flashes-then-quits, and this is a
-  hard SwiftUI-`WindowGroup` limitation, not a missing feature — do NOT re-attempt an in-process fix.**
-  On a cold `open -a agterm /path` (an `odoc` AppleEvent) SwiftUI auto-opens the `WindowGroup` window,
-  lets it FULLY initialize (it adopts a launch id, runs the scene `.task`, starts the control server,
-  runs `consumeReopen()` so `hasReopened` is already true), then RETRACTS the un-presented window
-  (SwiftUI's "don't keep an untitled window on a document launch" behavior) BEFORE delivering the open
-  event — and macOS then reaps the windowless odoc process (verified: `applicationShouldTerminateAfterLastWindowClosed`
-  returning `false` does NOT stop it, and no `applicationWillTerminate` fires).
-  This was proven NOT to be the deployed daily-driver twin (a fully-independent bundle id fails
-  identically) and is NOT fixable by the reference tricks: a forced `NSWorkspace.open` reopen never gets a
-  window-less moment and the claim queue strays the re-presented window (`adoptedLaunchID` is stuck +
-  `hasReopened` true); `applicationShouldOpenUntitledFile`/`applicationShouldHandleReopen` are never even
-  consulted on odoc; and `WindowGroup.defaultLaunchBehavior(.presented)` (the intended API) is macOS 15+
-  while the floor is macOS 14 and `SceneBuilder` rejects `if #available`.
-  The reference terminals confirm the shape: AppKit ones (Ghostty, iTerm, kitty, conterm) create
-  `NSWindow`s manually and never hit the retract; the SwiftUI-`WindowGroup` one that ships folder-open
-  (Muxy) routes it through its OWN CLI (socket when warm, argv/`oapp` when cold), never odoc.
-  The ONLY clean cold path is a relaunch (odoc → `oapp`), deliberately NOT taken (a double-launch flicker
-  for the rare not-running case; agterm is a daily driver, so warm covers ~all real use).
-  KEEP-IN-SYNC EXEMPT: `openSession(atDirectory:)` is the OS-`open` entry point onto a capability the
-  socket ALREADY exposes (`session.new --cwd <path>`, frontmost-defaulted), so it needs no new `Command`
-  case / `agtermctl` subcommand / `commands.html` entry — call it out as the exemption it is, like
-  `reveal`.
+- The Dock menu snapshots the last-active store and strongly retains item targets because `NSMenuItem.target`
+  is weak. Invalidate previous targets on rebuild. Every item except New Window keeps its captured scope,
+  rechecks that window's modal/dashboard/zoom state, raises it, and synchronously publishes
+  `frontmostWindowID` before invoking shared actions. Stale items become inert. New Window captures no
+  store and bypasses modal gating. Do not defer scope publication to key-window notifications.
+- Dock actions compose existing session/window/quick/dashboard/select capabilities and need no new command.
 
+## Model and persistence
+
+- Host-free `WindowLibrary` owns ordered `WindowInfo` values, live stores, and `frontmostWindowID`.
+  Use `WindowInfo`, not `Window`, to avoid framework name collisions. `WindowsIndex` has its own version,
+  independent of `Snapshot.version`; `WindowEntry` stores ID, name, and open state.
+- A window is open when its store is loaded. `loadStore` lazily caches `windows/<id>.json`; `newWindow`
+  seeds workspace 1 and a `$HOME` session. Keep at least one library entry. `openIDs` drives relaunch.
+  `applyInactiveWindowSidebarHiding` shows the active sidebar and hides other windows' sidebars.
+- `closeWindow` that empties the open set pins `frontmostWindowID` to the closing window.
+  The persisted index then has no open entries, so the next launch takes reopen's never-windowless
+  fallback — the pin makes it reopen the exit window (whose captured commands were just persisted),
+  not `windows.first`.
+- State lives under `AGTERM_STATE_DIR` or Application Support: `windows.json` plus
+  `windows/<uuid>.json`. Legacy `workspaces.json` remains dormant after migration. `PersistenceStore.fileName`
+  defaults to `workspaces.json`; index and window mutations save only their own files.
+- Bootstrap never throws. Load a valid index; otherwise recover every UUID-named per-window file before
+  considering legacy migration or an empty seed. Recovered files are appended before `loadStore`, named
+  `window N`, all opened, and the first made frontmost. Missing/corrupt window snapshots open with a
+  default workspace/session. The library is never empty after launch.
+
+## Scene lifecycle
+
+- Use plain `WindowGroup(id: "terminal")`, not value-based `WindowGroup(for:)`: with restoration off,
+  the value form opens no launch window and its task never bootstraps. The library owns the open set.
+- Appearing windows claim IDs from a FIFO queue: seed launch first, pop with `claimNextWindowID`, enqueue
+  new windows, and dismiss SwiftUI-restored strays. `reopenWindows` opens remaining IDs once behind
+  `hasReopened`.
+- Do not use `.restorationBehavior`; it requires macOS 15, the floor is 14, and `SceneBuilder` rejects
+  availability conditionals without an `AnyScene` eraser. Deduplicate by ID on both systems.
+- `TitleProbeView` sets `frameAutosaveName("agterm-window-<id>")`, reports key/main changes, and on close
+  tears down surfaces before `closeWindow`.
+  An app-exit close captures foreground commands first, while those surfaces are still alive; see
+  [[settings]] for that contract.
+- `AppActions`, commands, palette construction, `ControlServer`, `SettingsModel`, and `SessionSwitcher`
+  resolve through observable `WindowLibrary.activeStore`: frontmost open store, then first open store.
+- On termination, set `isTerminating` before windows close, then `saveAllOpen` and `saveIndex`. This preserves
+  live cwd changes, which structural saves may not capture. Selection and font use a roughly 0.3-second
+  `Debouncer`; structural mutations save synchronously and cancel pending saves.
+- Quit uses `applicationShouldTerminate` and a warning alert with host-free `openCounts` and
+  `QuitPrompt.message`. Skip it for system shutdown/restart/logout, no open windows, XCUITest, or an
+  unwired library during the first roughly four seconds. The system-quit policy is host-free in
+  `QuitReason.isSystemQuit(reasonTypeCode:)` and covered by `QuitReasonTests`.
+  The macOS host must read the Apple Event attribute with `kAEQuitReason` and pass only its plain `UInt32`
+  type code into the host-free core.
+  `AEKeyword("why?")` resolves to `UInt32.init?(String)` and is always nil.
+  The reason is an attribute, not a param, despite `AERegistry.h` calling it a parameter: loginwindow
+  writes it with `AEPutAttributePtr`. Never switch that read to `paramDescriptor`.
+  The GUI-only prompt is keep-in-sync exempt and manually verified.
+- App-side `WindowRegistry` maps IDs to `NSWindow`. Register/unregister through `TitleProbeView`;
+  `raise` deminiaturizes and fronts, and `close` uses `performClose` so standard teardown runs.
+
+## Quick terminal, notifications, and environment
+
+- `QuickTerminalController` is an app-level singleton hosting one `QuickTerminalPanel`, a borderless
+  non-activating `NSPanel` on `.canJoinAllSpaces` that lands on the POINTER's screen — it is summoned from
+  another application, where agterm's own key window is no guide to where the user is looking. Providers
+  resolve through `activeStore` at call time rather than capturing a window, `agtermApp.wireQuickTerminal`
+  binding them once after the socket binds. `canShow` refuses with no open window, agterm terminating on an
+  empty open set; the panel is not a library window, so it neither keeps the app alive nor appears in
+  `openIDs`.
+- Losing key hides a HUMAN-summoned panel (hotkey, ⌃`, toolbar, Dock), which is what makes it
+  summon-and-dismiss rather than window chrome. A control-driven `quick show` passes
+  `dismissOnFocusLoss: false` and pins it instead, because the caller's NEXT command runs while focus is
+  still settling and a blur-dismissing panel is already gone by the time `quick.type` or
+  `surface.zoom --target quick` arrives — measured, not theorised. `show` applies that pin even when the
+  panel is ALREADY visible, which is the case a script hits over a hotkey-summoned panel; `hide` and a shell
+  exit clear it. `NSApp.activate` is never called: activating raises agterm's own windows over the
+  application the panel was summoned from, so `.nonactivatingPanel` plus `orderFrontRegardless` is what lets
+  it take the keyboard while agterm stays inactive. A resign-driven hide records its time, and a show within
+  `reshowSuppression` is dropped — AppKit makes a clicked window key BEFORE delivering its button action, so
+  the toolbar and Dock toggles would otherwise re-show the panel the same click dismissed. This is AppKit
+  key-window behavior, so it is manually verified, not unit-tested.
+- The frame is 90% of the focused screen capped at `maxNormalSize` (1100x700). The in-window overlay needed
+  no cap because a window is already modest; 90% of a large display is a wall of terminal, not a quick
+  aside.
+- While the quick terminal OWNS THE KEYBOARD, no deck surface may be active. Gate main, split, maximized
+  split, scratch, and overlay with `deckInteractive && isActive && !quickTerminal.holdsKey`. Read `holdsKey`,
+  never `isVisible`: the predicate is app-level, so it inerts EVERY window, and a PINNED panel (a control
+  `quick show`) stays on screen after agterm loses key. Gating on visibility there makes
+  `TerminalView.updateNSView` revoke first responder in every window on the next SwiftUI update, so the user
+  clicks into a terminal, types, and loses the keyboard again at the next title or status change. The same
+  distinction governs `focusActiveSession`, `focusSplitPane`, the scratch's `suppressAutoFocus`,
+  `coverHidesActiveSession` and the Command-W rungs. `holdsKey` follows the panel's own
+  didBecomeKey/didResignKey, so a resign clears it whether or not the panel also hides.
+- The panel is not a window surface, so no window's `TerminalZoomController` can hold `.quick`;
+  `QuickTerminalController.isZoomed` owns it and `surface.zoom --target quick` grows the panel to fill its
+  screen. `resolveTarget` never returns `.quick` and `isTargetValid` always rejects it, so a stale value
+  clears. `zoomedSurface` reports `quick` from the app-level flag ahead of the window's own target.
+- `GlobalHotkey` registers the `keymap.conf` `global-hotkey` chord through Carbon `RegisterEventHotKey`,
+  which needs no Accessibility grant and CONSUMES the key, unlike an `NSEvent` global monitor. It is
+  re-registered on `.agtermKeymapChanged`. See [[keymap]] for the verb's grammar.
+- Notification identity is `"<windowID>:<sessionID>:<paneRole>"`. Capture resolves the owning window.
+  Reveal reopens a closed window through raise or enqueue/open, polls until its store loads, then selects
+  and focuses the pane. Unknown window/session only activates. This internal route is keep-in-sync exempt.
+- `GhosttySurfaceView` accepts an environment dictionary. `strdup` keys/values, retain a
+  `[ghostty_env_var_s]` beside `configCStrings`, call `ghostty_surface_new` inside its mutable-buffer
+  lifetime, and clear it with the strdup storage on destroy/deinit.
+- Tree surfaces inject `AGTERM_ENABLED`, window/workspace/session IDs, and `AGTERM_SOCKET`; split/overlay
+  inherit the session IDs. Quick terminal gets enabled and socket only — it belongs to no window, so it
+  carries no window id and an untargeted `agtermctl` run from it resolves the active window. Use
+  `ControlServer.boundSocketPath`, omitting the variable before bind, so overridden sockets match children.
+
+## Window state controls
+
+- `window.zoom` uses `NSWindow.zoom`: visible-frame maximize, not native fullscreen. The control toggle
+  requires an open window. Read back `isZoomed` on `window.list`.
+- `WindowControlArea` handles titlebar dragging and double-click because SwiftUI titlebar views do not
+  receive native handling. Set `mouseDownCanMoveWindow = false`; double-click reads live
+  `AppleActionOnDoubleClick`: Zoom/Fill zooms, Minimize miniaturizes, Do Nothing does nothing, and an absent
+  key defaults to Zoom. `AGTERM_UITEST_DOUBLECLICK_ACTION` overrides via environment because launch
+  arguments hit FB11763863. Decorative titlebar regions disable hit testing; buttons remain above them.
+- `window.fullscreen` uses `toggleFullScreen`, a distinct native Space. GUI surfaces are the palette,
+  `BuiltinAction.toggleFullscreen` with Ctrl-Command-F through the key monitor, AppKit's own injected
+  View menu item, and the green button. Control resolves an open ID; read back the `.fullScreen` style mask.
+- agterm ships NO full screen menu item. AppKit appends its own "Enter Full Screen" (`toggleFullScreen:`,
+  Globe+F) to the View menu as it is prepared for display, so any item of agterm's own is a visible
+  duplicate. All of these were measured and none suppresses it: removing the injected item on
+  `NSMenu.didBeginTrackingNotification` (posted once per ROOT tracking session, before the injection);
+  removing it deferred one runloop turn (too late — the displayed menu is already snapshotted, so the model
+  loses the item while the duplicate stays on screen); registering `NSFullScreenMenuItemEverywhere` false,
+  which macOS 26 ignores; and giving agterm's own item the `toggleFullScreen:` selector, which AppKit
+  injects past anyway. Do not install a menu delegate, which would replace SwiftUI updates.
+- `toggle_fullscreen` therefore has no menu item to carry its equivalent, and is matched in
+  `CustomCommandRunner`'s key monitor instead — the one built-in that does not ride a SwiftUI shortcut.
+  A half-typed leader sequence still wins. The menu affordance and Globe+F are AppKit's item.
+- `testViewMenuHasSingleFullScreenItem` asserts the item COUNT and matches on TITLE. Matching by
+  identifier silently fails to find the injected item, which is why the assertion it replaced passed for
+  months while the duplicate was on screen. Never trust the AX tree alone here: it reflects the menu model,
+  which a removal can change without changing the pixels. Verify a menu fix by opening the menu and looking.
+- `window.minimize` accepts `on`, `off`, or `toggle` through `ControlToggleMode`, defaulting to toggle.
+  Deterministic modes support park-all-but-one. GUI Command-M, yellow button, and titlebar preference use
+  AppKit directly, so observe `didMiniaturize`/`didDeminiaturize` to keep control read-back current.
+- Reject closed or full-screen windows for minimize; AppKit silently ignores full-screen miniaturize.
+  Poll the animated transition until `isMinimized == desired` before refreshing the cache. Retain geometry
+  for minimized windows through shared `resolvedScreen`: live screen, largest-overlap display, then main.
+  Geometry reads, move, and resize must share this resolver to preserve display-index round trips.
+- Minimizing the frontmost window calls `handOffFrontmost` to a visible open window. A minimized store
+  remains loaded, so `activeWindowID` cannot correct it. Background scripts receive no AppKit key-window
+  handoff; if all windows are minimized, retain the pointer. Minimized state is live-only.
+- CLI window subcommands normally take ID first. A bare `window minimize on` would parse `on` as the ID;
+  recover mode words by targeting `active`, as pinned by `windowMinimizeBareModeTargetsActive`. Do not copy
+  the mode-first `surface zoom --target` convention.
+- `window.new --minimized` reuses the existing command argument and `window.list.minimized`. Wait one poll
+  tick after registration before parking because `WindowAccessor` presents again on the next main turn.
+  Then hand frontmost off. `bringForwardForUITests` must latch as soon as the window is already presented;
+  otherwise its six ticks over 0.95 seconds undo a deliberate minimize.
+- Control changes to frontmost state must call `takeFrontmost`, which records, persists, and reconciles
+  auto-hidden sidebars. Inactive apps do not receive `didBecomeKey`, so relying on AppKit makes following
+  untargeted commands hit the previous window. This requires manual isolated verification: background
+  agterm, select the non-active window, confirm list marks it active and untargeted session creation lands
+  there. XCUITest cannot deactivate without disturbing the user's Space.
+
+## Attachment and cache
+
+- `window.new` is not ready when its store becomes open. Its `NSWindow` registers only after store
+  resolution, a second render, and `viewDidMoveToWindow`. Poll `WindowRegistry.isRegistered`; selection
+  waits for both open and registered. Never gate NSWindow work on `isOpen` alone.
+- `window.list` is served from `cachedWindowNodes`. Registration and unregistration post
+  `.agtermWindowAttachmentChanged`; observe it on `.main`, not synchronously, because unregister precedes
+  `closeWindow` and an immediate refresh captures `open: true` without geometry.
+- Refresh on every command, frontmost change, sidebar visibility change, attachment, and NSWindow
+  move/resize/fullscreen/minimize transitions. Ignore notification payloads: carrying non-Sendable
+  `Notification` into a main-actor region fails Swift 6 Release WMO even when Debug passes.
+
+## Control catalog
+
+- Commands are `window.new`, `window.list`, `window.select`, `window.close`, `window.rename`,
+  `window.delete`, `window.resize`, `window.move`, `window.zoom`, `window.fullscreen`, and
+  `window.minimize`. Keep their protocol cases, dispatch/actions, CLI mappings, and tests synchronized
+  per the repository-wide control contract.
+- `window.list` returns ID/name/open/active plus open-store auto-follow/sidebar state and live
+  geometry/fullscreen/zoom/minimize. Closed-window live fields are omitted. Geometry is top-left,
+  display-relative, y-down, matching move/resize.
+- Delete enforces at least one library entry without GUI confirmation. `window.select` raises or opens.
+  Window ID resolution accepts active, exact ID, unique prefix, ambiguity, and not found; most library
+  commands can address closed entries.
+- `window.resize` and `window.move` are control-native and require open windows. Validate positive sizes,
+  then clamp inside `WindowRegistry` with host-free `WindowGeometry`: size to min/visible frame, origin to
+  a grabbable screen strip. `WindowGeometry` may use CoreGraphics but not AppKit/Metal.
+- Global `--window` requires that window open. Without it, untargeted operations use active placement,
+  while an explicit session/workspace ID resolves across all open stores and returns its owning store.
+- For exact coverage names and command inventory, see [[control-api]]; do not duplicate its audit here.
+
+## Finder open
+
+- Warm `open -a agterm /path` (Discussion #230) resolves folders to themselves and files to parents,
+  queues them, and drains into the active store through `openSession(atDirectory:)`. Gate on a current
+  workspace and retry every 0.1 seconds for at most 50 ticks. After insertion, raise the active window so
+  a minimized target becomes visible.
+- `CFBundleDocumentTypes` with `public.folder` and Viewer role adds Finder's Open With entry; it is not
+  required for the `odoc` event itself.
+- Cold `open -a` is deliberately unsupported. SwiftUI fully initializes then retracts its auto-created
+  `WindowGroup` before delivering `odoc`, and macOS reaps the windowless process without
+  `applicationWillTerminate`. Independent bundle IDs reproduce it; preventing last-window termination,
+  forced reopen, untitled/reopen delegates, and in-process claim tricks do not solve it.
+- AppKit terminals create windows manually; Muxy's SwiftUI implementation routes cold opens through its
+  CLI. The clean workaround is an `odoc` to `oapp` relaunch, rejected because it double-launches and
+  flickers for the rare cold case. `defaultLaunchBehavior(.presented)` requires macOS 15 and cannot be
+  conditionally expressed in the macOS 14 `SceneBuilder`.
+- Finder open composes `session.new --cwd` with frontmost placement, so it is keep-in-sync exempt.

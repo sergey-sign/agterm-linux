@@ -30,7 +30,7 @@ log stream --predicate 'subsystem == "com.umputun.agterm"' --info
 log show --predicate 'subsystem == "com.umputun.agterm" && category == "CustomCommandRunner"' --info --last 30m
 ```
 
-The categories are `CustomCommandRunner`, `SettingsModel`, `GhosttyApp`, `NotificationManager`, and `ControlServer`. In Console.app, filter on the same subsystem.
+The categories are `GhosttyApp`, `GhosttySurfaceView`, `WatermarkRenderer`, `NotificationManager`, `SettingsView`, `SettingsModel`, `CustomCommandRunner`, and `ControlServer`. In Console.app, filter on the same subsystem.
 
 On Linux, launch the development binary from a terminal to retain stderr, or inspect the desktop-session journal:
 
@@ -87,6 +87,26 @@ A desktop notification is suppressed only when its exact terminal surface is foc
 Clicking a delivered notification selects its encoded pane and reopens its source window if that window was closed.
 An explicit `agtermctl notify` request deliberately bypasses focus suppression.
 
+## Terminals show "Terminal rendering needs OpenGL" on Linux
+
+The bundled Ghostty renderer is desktop-OpenGL-only, so the terminal widget pins its GL area to desktop GL.
+When that context cannot be created, the pane shows a generic overlay and the real reason goes to stderr:
+
+```
+agterm: GtkGLArea failed to create a GL context: <driver message>
+```
+
+Capture it by launching the binary from a terminal, or with `journalctl --user` as described under **Reading the logs**.
+The known cause is GTK 4.16 and later preferring the OpenGL ES API for its own EGL paint context, which makes a desktop-GL sibling context unrealizable; agterm now prevents it by setting `GDK_DISABLE=gles-api,vulkan` (`GDK_DEBUG=gl-disable-gles,vulkan-disable` on GTK 4.14–4.15) before GTK initializes.
+That is why a launch from a terminal prints one line such as `agterm: setting GDK_DISABLE=gles-api,vulkan` — it is expected, not an error, and `agterm: failed to set …` instead means the assignment did not take.
+Nothing is printed when there is nothing to assign: on GTK below 4.14 neither spelling exists, an ordinary
+environment that already carries both tokens is left exactly as it is, and `all` already selects both flags.
+Because GDK interprets tokens after `all` as exclusions, agterm removes either required flag if it appears
+there; appending it would re-enable the feature the policy must disable.
+
+To look deeper, run with `GDK_DEBUG=opengl` and read the context decisions: a paint context reported as `es:yes` is the GLES preference, and after the fix every context should report `es:no` with a desktop GL version.
+The `vulkan` token is part of the fix, not a tuning knob: with GTK's Vulkan renderer active, GSK cannot import the desktop-GL terminal texture and falls back to a per-frame CPU readback that is retained, which shows up as steadily climbing memory under heavy terminal output.
+
 ## Checking the keymap
 
 After editing `keymap.conf`, nothing changes until you reload it.
@@ -94,6 +114,13 @@ After editing `keymap.conf`, nothing changes until you reload it.
 - **Settings ▸ Key Mapping** shows a read-only list of parse problems (a malformed line, a dropped binding, a conflict). This is the first place to look when a binding does not behave.
 - **File ▸ Reload Keymap** re-reads the file. A reload that found problems posts a banner with the count.
 - **`agtermctl keymap reload`** does the same from the command line and prints the diagnostic count (`0` means a clean reload).
+- **`agtermctl keymap list`** shows what is actually bound: every built-in with the chord it resolved to, the custom commands, each diagnostic in full rather than just a count, and the key equivalents the menu bar is really carrying.
+
+## A keybinding does not fire
+
+Run `agtermctl keymap list` and compare its two lists. If the action's chord is what you expect but no menu entry carries it (or a different item does), the keymap is fine and the menu is stale: agterm rebuilds the menu when the app next becomes active, so switch to another app and back, and relaunch if it persists.
+
+One built-in is legitimately missing from the menu list: `undo_close` (⌘Z) is delivered by a key monitor rather than a menu item, so that native text undo keeps working in the rename, palette and Settings fields. Its absence there is expected.
 
 ## The keymap editor will not open
 
@@ -123,7 +150,7 @@ Work down this list:
 5. **Focus.** A custom chord fires only while a terminal pane holds keyboard focus. When the sidebar, the inline rename field, a Settings field, or a palette has focus, the chord passes through. Click into the terminal first.
 6. **The command runs in a plain `/bin/sh -c`, not your login shell.** It does not load `~/.zshrc` or `~/.bashrc`, so shell aliases and functions are not available and `PATH` may be shorter than in your terminal. Use absolute paths, or wrap the body in `$SHELL -lc '…'`.
 7. **Exit status.** A non-zero exit posts a failure banner with the code. No banner and no effect usually means the chord never fired (causes above). A banner means it ran and failed, which points at the command itself, its `PATH`, or its arguments.
-8. **Token quoting.** `{AGT_SELECTION}` and the other `{AGT_*}` tokens expand raw into the shell line. For content that may contain shell metacharacters, use the `$AGT_SELECTION` environment form, which is already quoted. The token list is in the keymap section of the README.
+8. **Token quoting.** `{AGT_SELECTION}` and the other `{AGT_*}` tokens expand raw into the shell line. For content that may contain shell metacharacters, use the `$AGT_SELECTION` environment form, which is already quoted. The token list is in the [keymap section of the documentation](https://agterm.com/docs#keymap).
 
 Reload after every edit (File ▸ Reload Keymap, or `agtermctl keymap reload`). Edits are not applied until you do.
 
@@ -153,9 +180,27 @@ The full ghostty key reference is at <https://ghostty.org/docs/config>.
 
 ## Copy/paste and shortcuts on a non-Latin or alternative layout
 
+On Linux, agterm resolves shortcuts once per active layout, matching upstream macOS behavior.
+ASCII-capable layouts remain semantic, so alternative Latin layouts and their shifted punctuation stay layout-local.
+Layouts that cannot type the complete ASCII alphabet resolve every shortcut key by its physical ANSI position.
+This keeps shortcuts such as Ctrl+Shift+J working after an English-to-Russian switch and also covers Greek or Hebrew positions that produce ASCII punctuation instead of letters.
+Ctrl+Shift+Tab reverses the active Ctrl-Tab session cycle; Ctrl+Tab with additional modifiers remains reserved for that switcher.
+
 ⌘C and ⌘V copy and paste on any keyboard layout, non-Latin ones (Russian, Greek, and so on) included, because agterm binds them to the physical key positions rather than to the character a layout prints. The physical C and V keys then work no matter what those keys produce in the active layout.
 
 The reason is that ghostty's own copy/paste binds match the produced character: on a Russian layout the physical V key yields `м`, so the built-in `super+v` bind never fires. The bundled agterm defaults add physical-key binds (`super+key_c`, `super+key_v`) that match by position instead.
+
+On Linux the bundled defaults bind the terminal-convention chord the same way — `ctrl+shift+key_c`, `ctrl+shift+key_v`, and `ctrl+shift+key_a` — because bare Ctrl+C is SIGINT there. They match by physical position regardless of the produced glyph, so Ctrl+Shift+C/V/A keep working after switching to Russian, Greek, Hebrew, Arabic, or Thai.
+
+On macOS, the physical `super+key_*` fallbacks always consume the key, even when there is nothing to act on: ⌘C with no selection does nothing at all, rather than reaching the running program.
+That is deliberate.
+The Edit menu disables Copy without a selection and Paste without pasteable content — on every layout — so those presses fall to the terminal's own bind, and a bind that declined them would let the chord through to key encoding.
+A plain shell shows nothing either way, but under the kitty keyboard protocol, which Claude Code and other TUIs turn on, the program receives the chord as a key report and renders it as text — a stray `с` or `^[[1089;9u` in the prompt.
+If you rebind copy or paste on macOS, do not add ghostty's `performable:` prefix for the same reason.
+
+Linux deliberately keeps ghostty's `performable:` prefix on the bundled `ctrl+shift+key_c`, `ctrl+shift+key_v`, and `ctrl+shift+key_a` bindings.
+When copy, paste, or select all cannot run, ghostty lets the chord fall through instead of consuming it.
+Keep `performable:` on a Linux replacement if you want the same behavior; omit it only when you intentionally want an unavailable action to consume the chord.
 
 The same distinction lets you remap any shortcut for your layout:
 
@@ -171,14 +216,48 @@ keybind = super+c=copy_to_clipboard
 keybind = super+v=paste_from_clipboard
 ```
 
+On Linux the same remap unbinds the `ctrl+shift+key_*` defaults instead. C, V, and A are three separate binds, so freeing and rebinding each one takes its own line:
+
+```
+keybind = ctrl+shift+key_c=unbind
+keybind = ctrl+shift+key_v=unbind
+keybind = ctrl+shift+key_a=unbind
+keybind = ctrl+shift+c=copy_to_clipboard
+keybind = ctrl+shift+v=paste_from_clipboard
+keybind = ctrl+shift+a=select_all
+```
+
 Reload with **File ▸ Reload Config** or `agtermctl config reload`. The keybind syntax is at <https://ghostty.org/docs/config/keybind/reference>.
 
 ## Other common issues
 
 - **`agtermctl: command not found`.** Install it from Help ▸ Install Command Line Tool… (it symlinks into `/usr/local/bin`). You can also call it by its full path inside the app bundle: `agterm.app/Contents/MacOS/agtermctl`.
-- **No desktop notifications.** macOS must have granted permission (System Settings ▸ Notifications ▸ agterm), and Settings ▸ General ▸ Notifications must be on. The unseen-count badge still tracks even when banners are off.
-- **Agent-status glyph does not update.** Install the hooks from Help ▸ Install Agent Status Hooks…. For shell-integrated agents, start a fresh shell so the `source` line added to your shell rc takes effect. For Pi, restart it or run `/reload` so it loads `~/.pi/agent/extensions/agterm-status.ts`; Pi status is only installed when `~/.pi/agent` already exists. The hooks call `agtermctl session status`, so `agtermctl` must resolve first (see above).
+- **No desktop notifications.** Check **Settings ▸ Notifications ▸ Show notification banners** first — when it is off, `agtermctl notify` still reports success and the unseen-count badge still tracks, but nothing is posted to macOS. Since agterm 0.17.0 the command says so, answering `badge updated, but "Show notification banners" is off, so no banner was posted` instead of a bare `ok`. macOS must also have granted permission (System Settings ▸ Notifications ▸ agterm), and Do Not Disturb / a Focus mode suppresses banners system-wide.
+
+  To tell "never posted" from "posted but not shown", run `agtermctl notify "test"` and check two things: `agtermctl tree --json` — a rising `unseen` on the target session proves the command reached the notification path — and the log below, which now records every posted and every suppressed notification.
+- **A permission prompt carrying agterm's name, or a tool that cannot get one.** Command-line tools request Automation, Camera, Microphone, Contacts, Calendars, Reminders, Photos, Location, Bluetooth, local network, speech recognition, system administration and system audio recording *through* agterm: macOS treats agterm as the responsible app, so the prompt names agterm and the answer is recorded against agterm rather than against the tool. One grant then covers every program in every session, with no further prompt. A dismissed prompt is not re-offered either, the tool just keeps failing (`osascript` reports "Not authorized to send Apple events"), so change the answer in System Settings ▸ Privacy & Security under the matching service, for example Automation ▸ agterm.
+- **Agent-status glyph does not update.** Install the hooks from Help ▸ Install Agent Status Hooks…. For shell-integrated agents, start a fresh shell so the `source` line added to your shell rc takes effect. For Pi, restart it or run `/reload` so it loads `~/.pi/agent/extensions/agterm-status.ts`; Pi status is only installed when `~/.pi/agent` already exists. For OpenCode, restart it so it loads `~/.config/opencode/plugins/agterm-status.js`; the plugin installs only when `~/.config/opencode` already exists. The hooks call `agtermctl session status`, so `agtermctl` must resolve first (see above).
 - **Agent-status glyph updates the wrong session.** One session's glyph blinks while the work happens in another — typically when agents run inside tmux (or a tmux-backed session manager such as agent-deck). The working process inherited another session's `AGTERM_SESSION_ID`: the status hooks target whatever id is in their environment, and a long-lived daemon started from inside an agterm session (a tmux server is the usual carrier) captures that session's `AGTERM_*` variables into its global environment and passes them to every child it ever creates. Check `tmux show-environment -g | grep AGTERM` — if present, clear them with `tmux set-environment -g -r AGTERM_SESSION_ID` (and the other `AGTERM_*` names), then restart the affected panes. To avoid it, start such daemons with the variables scrubbed (`env -u AGTERM_SESSION_ID … <command>`) or from a terminal outside agterm.
+
+## ⌘-hover does not underline links inside tmux or vim
+
+Inside a program that has turned mouse reporting on, ⌘-hover stops underlining URLs, the pointer stays a
+text bar instead of becoming a hand, and ⌘-click opens nothing. All four go together, and they come back
+the moment you leave that program.
+
+This is not a bug. libghostty detects links only while the foreground program has mouse reporting off, so
+a program that captures the mouse takes link handling with it. Ghostty.app behaves the same way. It is
+per-program, not a property of any category of app: `tmux` with `mouse on` and stock `vim` (whose
+`defaults.vim` sets `mouse=a`) both suppress it, while an agent CLI that never touches mouse reporting
+leaves links working normally.
+
+Hold shift as well — ⌘⇧-hover and ⌘⇧-click — to bypass the capture without changing any setting. A program
+can claim shift for itself with `XTSHIFTESCAPE`, in which case add `mouse-shift-capture = never` to
+`~/.config/agterm/ghostty.conf` so shift always wins.
+
+To turn mouse reporting off for every program instead, set `mouse-reporting = false` in the same file.
+Selection and links then always work, at the cost of mouse support inside programs that wanted it — mouse
+scrolling in `tmux`, clicking to position the cursor in `vim`.
 
 ## Claude Code's question or permission prompt stops responding after switching apps
 

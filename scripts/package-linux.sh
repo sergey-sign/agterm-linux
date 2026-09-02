@@ -18,8 +18,11 @@ if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?
   exit 2
 fi
 
+# shellcheck source=../linux/arch.sh
+source "$ROOT/linux/arch.sh"
+
 NFPM="${NFPM:-$(command -v nfpm || true)}"
-LINUXDEPLOY="${LINUXDEPLOY:-$(command -v linuxdeploy-x86_64.AppImage || command -v linuxdeploy || true)}"
+LINUXDEPLOY="${LINUXDEPLOY:-$(command -v "linuxdeploy-$HOST_ARCH.AppImage" || command -v linuxdeploy || true)}"
 [[ -x "$NFPM" ]] || { echo "nfpm is required to build DEB and RPM packages" >&2; exit 1; }
 [[ -x "$LINUXDEPLOY" ]] || { echo "linuxdeploy is required to build the AppImage" >&2; exit 1; }
 command -v linuxdeploy-plugin-gtk.sh >/dev/null \
@@ -36,15 +39,16 @@ rm -rf "$OUT"
 mkdir -p "$OUT" "$APPDIR/usr"
 AGTERM_PACKAGE_VERSION="$VERSION" "$ROOT/scripts/stage-linux.sh" "$PAYLOAD"
 
-TAR="$OUT/agterm-linux-v${VERSION}-x86_64.tar.gz"
-DEB="$OUT/agterm-linux-v${VERSION}-x86_64.deb"
-RPM="$OUT/agterm-linux-v${VERSION}-x86_64.rpm"
-APPIMAGE="$OUT/agterm-v${VERSION}-x86_64.AppImage"
+TAR="$OUT/agterm-linux-v${VERSION}-${HOST_ARCH}.tar.gz"
+DEB="$OUT/agterm-linux-v${VERSION}-${HOST_ARCH}.deb"
+RPM="$OUT/agterm-linux-v${VERSION}-${HOST_ARCH}.rpm"
+APPIMAGE="$OUT/agterm-v${VERSION}-${HOST_ARCH}.AppImage"
 
 tar czf "$TAR" -C "$WORK" agterm-linux
 
 export AGTERM_PACKAGE_VERSION="$VERSION"
 export AGTERM_PACKAGE_ROOT="$PAYLOAD"
+export AGTERM_PACKAGE_ARCH="$PACKAGE_ARCH"
 "$NFPM" package --config "$ROOT/packaging/linux/nfpm.yml" --packager deb --target "$DEB"
 "$NFPM" package --config "$ROOT/packaging/linux/nfpm.yml" --packager rpm --target "$RPM"
 

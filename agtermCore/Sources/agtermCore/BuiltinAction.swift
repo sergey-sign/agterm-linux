@@ -1,11 +1,7 @@
-import Foundation
-
-/// A rebindable, menu-backed built-in action. Each case has a canonical kitty-style raw name (the
-/// token the user writes after `map` in `keymap.conf`) and a `defaultChord` — the shortcut the menu
-/// ships with today, or `nil` for an action that has no default key.
-///
-/// The raw names mirror the menu items in `agtermApp`'s `.commands`; `defaultChord` is the single
-/// source of truth for those default shortcuts once the menu reads `equivalent(for:)`.
+/// A rebindable, menu-backed built-in action. Each case has a canonical kitty-style raw name (the token the
+/// user writes after `map` in `keymap.conf`) and a `defaultChord` — the shortcut the menu ships with, or
+/// `nil` for an action with no default key. The raw names mirror the menu items in `agtermApp`'s
+/// `.commands`; `defaultChord` is the single source of truth for those shortcuts, read via `equivalent(for:)`.
 public enum BuiltinAction: String, CaseIterable, Sendable {
     case newWindow = "new_window", renameWindow = "rename_window", deleteWindow = "delete_window"
     case newWorkspace = "new_workspace", renameWorkspace = "rename_workspace", deleteWorkspace = "delete_workspace"
@@ -13,10 +9,14 @@ public enum BuiltinAction: String, CaseIterable, Sendable {
     case duplicateSession = "duplicate_session"
     case closeSession = "close_session", reopenRecent = "reopen_recent", undoClose = "undo_close", clearStatus = "clear_status"
     case increaseFontSize = "increase_font_size", decreaseFontSize = "decrease_font_size", resetFontSize = "reset_font_size"
-    case toggleSplit = "toggle_split", toggleScratch = "toggle_scratch", toggleTerminalZoom = "toggle_terminal_zoom"
+    case toggleSplit = "toggle_split", toggleHorizontalSplit = "toggle_horizontal_split"
+    case toggleScratch = "toggle_scratch", toggleTerminalZoom = "toggle_terminal_zoom"
     case toggleSearch = "toggle_search"
     case toggleSidebar = "toggle_sidebar", selectTheme = "select_theme", toggleFullscreen = "toggle_fullscreen"
     case toggleFlaggedView = "toggle_flagged_view", toggleFlag = "toggle_flag", focusWorkspace = "focus_workspace"
+    case toggleWorkspaceFilter = "toggle_workspace_filter"
+    case previousWorkspace = "previous_workspace", nextWorkspace = "next_workspace"
+    case toggleWorkspaceCollapse = "toggle_workspace_collapse"
     case focusLeftPane = "focus_left_pane", focusRightPane = "focus_right_pane"
     case previousSession = "previous_session", nextSession = "next_session"
     case previousAttentionSession = "previous_attention_session", nextAttentionSession = "next_attention_session"
@@ -25,17 +25,10 @@ public enum BuiltinAction: String, CaseIterable, Sendable {
     case customCommandPalette = "custom_command_palette", showAttention = "show_attention"
     case dashboard = "dashboard"
 
-    /// The shipped default chord for this action, or `nil` when it has no default key today.
-    ///
-    /// `nil` covers two groups: the keyless actions (`rename_*`/`delete_*`/`duplicate_session`/`clear_status`/
-    /// `first_session`/`last_session`/`select_theme`/`toggle_flagged_view`/`focus_workspace`),
-    /// which gain a key only when the user `map`s one; AND the six
-    /// arrow-bound actions (`focus_left_pane` ⌘⌥←, `focus_right_pane` ⌘⌥→, `previous_session` ⌥⌘↑,
-    /// `next_session` ⌥⌘↓, `previous_attention_session` ⌃⌥↑, `next_attention_session` ⌃⌥↓). Arrows are
-    /// NOT expressible as a parsed `Chord` (`parseKeybind` only accepts single-char keys or
-    /// `tab`/`space`/`return`/`delete`), so they cannot round-trip through the keymap grammar and are not
-    /// returned here. The menu keeps its hardcoded arrow shortcut as the
-    /// fallback when `equivalent(for:)` is nil; the user can still re-`map` these to a parseable chord.
+    /// The shipped default chord, or `nil` for a keyless action, which gains a key only when the user
+    /// `map`s one. Every action that ships with a key returns it here, including the six arrow-bound ones —
+    /// arrows are part of the chord grammar, so their defaults round-trip through `keymap.conf` like any
+    /// other and the menu needs no hardcoded fallback.
     public var defaultChord: Chord? {
         switch self {
         case .newWindow: return Chord(mods: [.command, .option], key: "n")
@@ -49,6 +42,7 @@ public enum BuiltinAction: String, CaseIterable, Sendable {
         case .decreaseFontSize: return Chord(mods: [.command], key: "-")
         case .resetFontSize: return Chord(mods: [.command], key: "0")
         case .toggleSplit: return Chord(mods: [.command], key: "d")
+        case .toggleHorizontalSplit: return Chord(mods: [.command, .shift], key: "d")
         case .toggleScratch: return Chord(mods: [.command], key: "j")
         case .toggleTerminalZoom: return Chord(mods: [.command, .shift], key: "return")
         case .toggleSearch: return Chord(mods: [.command], key: "f")
@@ -60,31 +54,17 @@ public enum BuiltinAction: String, CaseIterable, Sendable {
         case .commandPalette: return Chord(mods: [.control, .shift], key: "p")
         case .customCommandPalette: return Chord(mods: [.control, .shift], key: "o")
         case .showAttention: return Chord(mods: [.control, .shift], key: "i")
-        case .dashboard: return Chord(mods: [.command, .shift], key: "d")
+        case .dashboard: return Chord(mods: [.command, .shift], key: "g")
+        case .focusLeftPane: return Chord(mods: [.command, .option], key: "left")
+        case .focusRightPane: return Chord(mods: [.command, .option], key: "right")
+        case .previousSession: return Chord(mods: [.command, .option], key: "up")
+        case .nextSession: return Chord(mods: [.command, .option], key: "down")
+        case .previousAttentionSession: return Chord(mods: [.control, .option], key: "up")
+        case .nextAttentionSession: return Chord(mods: [.control, .option], key: "down")
         case .renameWindow, .deleteWindow, .renameWorkspace, .deleteWorkspace, .renameSession, .duplicateSession,
-             .clearStatus, .firstSession, .lastSession, .selectTheme, .toggleFlaggedView, .focusWorkspace:
+             .clearStatus, .firstSession, .lastSession, .selectTheme, .toggleFlaggedView, .focusWorkspace,
+             .toggleWorkspaceFilter, .previousWorkspace, .nextWorkspace, .toggleWorkspaceCollapse:
             return nil
-        case .focusLeftPane, .focusRightPane, .previousSession, .nextSession,
-             .previousAttentionSession, .nextAttentionSession:
-            // arrow-bound: not expressible as a parsed Chord; the menu keeps its hardcoded arrow key.
-            return nil
-        }
-    }
-
-    /// The hardcoded macOS menu glyph for the six arrow-bound actions, whose default shortcut can't
-    /// round-trip through `Chord`/`keymap.conf` (so `defaultChord` is nil). `nil` for every other
-    /// action — a keyless action stays keyless until the user maps a chord. This is the display
-    /// counterpart of the menu's hardcoded arrow `.keyboardShortcut`, used by `Keymap.glyphHint(for:)`
-    /// to render an action's current shortcut in the action palette and the toolbar tooltips.
-    public var arrowGlyphFallback: String? {
-        switch self {
-        case .focusLeftPane: return "⌥⌘←"
-        case .focusRightPane: return "⌥⌘→"
-        case .previousSession: return "⌥⌘↑"
-        case .nextSession: return "⌥⌘↓"
-        case .previousAttentionSession: return "⌃⌥↑"
-        case .nextAttentionSession: return "⌃⌥↓"
-        default: return nil
         }
     }
 }

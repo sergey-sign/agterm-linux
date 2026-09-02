@@ -2,28 +2,6 @@ import CGtk
 import Foundation
 import agtermCore
 
-/// Idle-deferred second half of `dismissContextMenu`: release the ref that kept the dismissed
-/// popover's widget tree alive until the button-"clicked" emission that triggered the dismissal
-/// fully unwound. Only the finalization is deferred — the unparent itself stays synchronous, since
-/// `rebuildSidebar`'s remove-all loop cannot clear a listbox that still holds a popover child
-/// (gtk_box_remove refuses non-layout children, and the `while first_child` loop then never ends).
-private let onDeferredPopoverUnref: @MainActor @convention(c) (gpointer?) -> gboolean = { data in
-    guard let data else { return 0 }
-    g_object_unref(data)
-    return 0
-}
-
-/// Idle-deferred row context menu: when opening the menu rebuilt the sidebar (selecting a split
-/// session focuses a pane → surfaceDidFocus → rebuildSidebar), the popup waits one idle cycle so
-/// the fresh rows get laid out and mapped first.
-private let onDeferredRowContextMenu: @MainActor @convention(c) (gpointer?) -> gboolean = { data in
-    guard let data else { return 0 }
-    MainActor.assumeIsolated {
-        Unmanaged<AppController>.fromOpaque(data).takeUnretainedValue().presentPendingRowContextMenu()
-    }
-    return 0
-}
-
 @MainActor
 extension AppController {
     // MARK: - Row context menu
@@ -36,57 +14,31 @@ extension AppController {
         return duplicate
     }
 
-    func showRowContextMenu(listBox: OpaquePointer, x: Double, y: Double) {
-        guard let rowPtr = gtk_list_box_get_row_at_y(listBox, Int32(y)),
-              let sid = rowSession[OpaquePointer(rowPtr)] else { return }
+    func showRowContextMenu(row: OpaquePointer, x: Double, y: Double) {
+        guard let sid = rowSession[row] else { return }
         noteUserActivity()
         if !store.sidebarSelectionIDs.contains(sid) {
+            // This path bypasses `selectSession`, so it owes its end-search convention.
+            endSearchForSelectionChange()
             store.selectSession(sid, sidebarSelection: [sid])
             sidebarSelectionAnchor = sid
             syncSidebarSelection()
-            showActive()
+            // `focus: false`: a grab here re-enters `rebuildSidebar` and frees the row this function
+            // parents the menu to below.
+            showActive(focus: false)
         }
-        // showActive's pane focus can SYNCHRONOUSLY rebuild the sidebar (focusing a split session's
-        // pane → surfaceFocusEnter → surfaceDidFocus → rebuildSidebar), destroying the listBox and
-        // row this gesture reported — using them is a use-after-free that crashes
-        // gtk_widget_set_parent/popup. Re-resolve the session's LIVE row; and when the rebuild DID
-        // happen (the live list box differs), the fresh rows have no layout yet, so a synchronous
-        // popup anchors to a zero allocation on an unmapped parent and never appears — defer the
-        // menu one idle cycle instead (idles run after GTK's layout/map phase).
-        guard let liveRow = rowSession.first(where: { $0.value == sid })?.key,
-              let liveListBox = gtk_widget_get_parent(W(liveRow)) else { return }
-        if OpaquePointer(liveListBox) == listBox {
-            presentRowContextMenu(sid: sid, anchorX: x)
-        } else {
-            pendingContextMenuSessionID = sid
-            g_idle_add(onDeferredRowContextMenu, Unmanaged.passUnretained(self).toOpaque())
-        }
-    }
-
-    func presentPendingRowContextMenu() {
-        guard let sid = pendingContextMenuSessionID else { return }
-        pendingContextMenuSessionID = nil
-        presentRowContextMenu(sid: sid, anchorX: nil)
-    }
-
-    /// Build and pop up the row context menu for `sid`, parented to the session's CURRENT sidebar
-    /// row's list box. `anchorX` keeps the click's horizontal position when known (the synchronous
-    /// path); the deferred path passes nil and anchors near the row's leading edge.
-    private func presentRowContextMenu(sid: UUID, anchorX: Double?) {
-        guard let row = rowSession.first(where: { $0.value == sid })?.key,
-              let listBox = gtk_widget_get_parent(W(row)) else { return }
-        var rowAlloc = GtkAllocation()
-        gtk_widget_get_allocation(W(row), &rowAlloc)
         // Tear down the previous popover before storing the replacement. Popping down a newly-created,
-        // not-yet-mapped GtkPopover crashes inside gtk_popover_popdown.
-        dismissContextMenu()
+        // not-yet-mapped GtkPopover crashes inside gtk_popover_popdown. Read the capture BEFORE the
+        // dismissal consumes it (see `popupPopover`).
+        let heldSearchEntry = searchEntryCaptureSurvives(contextMenuPopover)
+        dismissContextMenu(refocus: false)
         contextMenuSession = sid
         guard let popover = op(gtk_popover_new()) else { return }
         attachControllerContext(to: popover, windowID: windowID)
         contextMenuPopover = popover
-        gtk_widget_set_parent(W(popover), listBox)
-        var rect = GdkRectangle(x: Int32(anchorX ?? Double(rowAlloc.x + 24)),
-                                y: rowAlloc.y + rowAlloc.height / 2, width: 1, height: 1)
+        connectContextMenuClosed(popover)
+        gtk_widget_set_parent(W(popover), W(row))
+        var rect = GdkRectangle(x: Int32(x), y: Int32(y), width: 1, height: 1)
         gtk_popover_set_pointing_to(POPOVER(popover), &rect)
         gtk_popover_set_position(POPOVER(popover), GTK_POS_RIGHT)
         let box = op(gtk_box_new(GTK_ORIENTATION_VERTICAL, 0))
@@ -98,6 +50,9 @@ extension AppController {
         if targets.count == 1 {
             addContextButton(box, "Rename",
                              unsafeBitCast(onCtxRename as @convention(c) (OpaquePointer?, gpointer?) -> Void, to: GCallback.self))
+            addContextButton(box, "Copy Name",
+                             unsafeBitCast(onCtxCopyName as @convention(c) (OpaquePointer?, gpointer?) -> Void,
+                                           to: GCallback.self))
             addContextButton(box, "Duplicate Session",
                              unsafeBitCast(onCtxDuplicate as @convention(c) (OpaquePointer?, gpointer?) -> Void,
                                            to: GCallback.self))
@@ -125,7 +80,14 @@ extension AppController {
         addContextButton(box, targets.count > 1 ? "Close \(targets.count) Sessions" : "Close Session",
                          unsafeBitCast(onCtxClose as @convention(c) (OpaquePointer?, gpointer?) -> Void, to: GCallback.self))
         gtk_popover_set_child(POPOVER(popover), W(box))
-        gtk_popover_popup(POPOVER(popover))
+        popupPopover(popover, keepingCapture: heldSearchEntry)
+    }
+
+    /// Every popover assigned to the shared `contextMenuPopover` slot must connect this, or GTK's own
+    /// Escape / click-away dismissal goes unnoticed.
+    private func connectContextMenuClosed(_ popover: OpaquePointer) {
+        connect(popover, "closed", unsafeBitCast(onCtxClosed as @convention(c)
+            (OpaquePointer?, gpointer?) -> Void, to: GCallback.self))
     }
 
     private func addContextButton(_ box: OpaquePointer?, _ label: String, _ handler: GCallback?) {
@@ -136,29 +98,40 @@ extension AppController {
         gtk_box_append(cast(box), W(button))
     }
 
-    /// Pop down and unparent the menu NOW, but keep its widget tree ALIVE (one extra ref, released
-    /// in an idle callback) until the current signal emission unwinds. Every menu item handler
-    /// calls this from the "clicked" emission of a button INSIDE the popover; letting the unparent
-    /// drop the last ref frees widgets that emission is still walking, which corrupts GTK's
-    /// popover/grab bookkeeping — later menus silently fail to appear and a subsequent
-    /// gtk_popover_popup crashes on freed memory. The unparent itself must stay synchronous:
-    /// the same handlers trigger a sidebar rebuild whose remove-all loop spins forever on a
-    /// listbox that still holds a popover child.
-    func dismissContextMenu() {
-        if let popover = contextMenuPopover {
-            contextMenuPopover = nil
-            _ = g_object_ref(RAW(popover))
-            gtk_popover_popdown(POPOVER(popover))
-            gtk_widget_unparent(W(popover))
-            g_idle_add(onDeferredPopoverUnref, RAW(popover))
-        }
+    /// Whether a sidebar context menu is on screen right now. Visibility, not the bare handle: a missed
+    /// `"closed"` emission may then let a deferred rebuild run, but can never make it defer forever.
+    var contextMenuIsOpen: Bool {
+        guard let popover = contextMenuPopover else { return false }
+        return gtk_widget_get_visible(W(popover)) != 0
+    }
+
+    /// Programmatic dismissal: an item was activated, a new menu is opening, or the window is closing.
+    /// Escape and click-away arrive at `contextMenuDidClose` instead.
+    func dismissContextMenu(refocus: Bool = true) {
+        guard let popover = contextMenuPopover else { return }
+        clearContextMenuState()
+        detachPopover(popover, popdown: true, refocus: refocus)
+    }
+
+    /// GTK dismissed the menu itself: Escape, or a click away.
+    func contextMenuDidClose(_ popover: OpaquePointer?) {
+        guard let popover, popover == contextMenuPopover else { return }
+        clearContextMenuState()
+        detachPopover(popover, popdown: false)
+    }
+
+    /// Always called BEFORE `detachPopover(popdown: true)`, so the `"closed"` that popdown emits
+    /// synchronously early-returns instead of unparenting twice.
+    private func clearContextMenuState() {
+        contextMenuPopover = nil
         contextMoveTargets.removeAll()
     }
 
     func contextFocusWorkspace() {
         guard let id = contextMenuSession, let ws = store.workspace(forSession: id) else { return }
         dismissContextMenu()
-        focusWorkspace(store.focusedWorkspaceID == ws.id ? nil : ws.id)
+        store.toggleFocusedWorkspace(ws.id)
+        rebuildSidebar()
     }
 
     func contextMoveToWorkspace(_ data: gpointer?) {
@@ -185,6 +158,12 @@ extension AppController {
         startRenameActive()
     }
 
+    func contextCopyName() {
+        guard let id = contextMenuSession, let name = store.session(withID: id)?.displayName else { return }
+        dismissContextMenu()
+        name.withCString { gdk_clipboard_set_text(gtk_widget_get_clipboard(W(window)), $0) }
+    }
+
     func contextDuplicate() {
         guard let id = contextMenuSession else { return }
         dismissContextMenu()
@@ -200,29 +179,59 @@ extension AppController {
     func showWorkspaceContextMenu(_ rowData: gpointer?, x: Double, y: Double) {
         guard let rowData, let wsID = workspaceDiscButtons[OpaquePointer(rowData)] else { return }
         let parent = OpaquePointer(rowData)
-        // See showRowContextMenu: the old popover must be dismissed before the new one is registered.
-        dismissContextMenu()
+        // See showRowContextMenu: dismiss the old popover before registering the new one, capture first.
+        let heldSearchEntry = searchEntryCaptureSurvives(contextMenuPopover)
+        dismissContextMenu(refocus: false)
         contextMenuWorkspace = wsID
         guard let popover = op(gtk_popover_new()) else { return }
         attachControllerContext(to: popover, windowID: windowID)
         contextMenuPopover = popover
+        connectContextMenuClosed(popover)
         gtk_widget_set_parent(W(popover), W(parent))
         var rect = GdkRectangle(x: Int32(x), y: Int32(y), width: 1, height: 1)
         gtk_popover_set_pointing_to(POPOVER(popover), &rect)
         gtk_popover_set_position(POPOVER(popover), GTK_POS_RIGHT)
         let box = op(gtk_box_new(GTK_ORIENTATION_VERTICAL, 0))
+        addContextButton(box, store.isSoleFocus(wsID) ? "Unfocus" : "Focus",
+                         unsafeBitCast(onCtxWorkspaceFocus as @convention(c)
+                            (OpaquePointer?, gpointer?) -> Void, to: GCallback.self))
+        addContextButton(box, store.focusedWorkspaceIDs.contains(wsID) ? "Remove from Focus" : "Add to Focus",
+                         unsafeBitCast(onCtxWorkspaceFocusMembership as @convention(c)
+                            (OpaquePointer?, gpointer?) -> Void, to: GCallback.self))
         addContextButton(box, "Rename", unsafeBitCast(onCtxWorkspaceRename as @convention(c) (OpaquePointer?, gpointer?) -> Void, to: GCallback.self))
+        addContextButton(box, "Copy Name", unsafeBitCast(onCtxWorkspaceCopyName as @convention(c) (OpaquePointer?, gpointer?) -> Void, to: GCallback.self))
         if store.canRemoveWorkspace {
             addContextButton(box, "Delete Workspace", unsafeBitCast(onCtxWorkspaceDelete as @convention(c) (OpaquePointer?, gpointer?) -> Void, to: GCallback.self))
         }
         gtk_popover_set_child(POPOVER(popover), W(box))
-        gtk_popover_popup(POPOVER(popover))
+        popupPopover(popover, keepingCapture: heldSearchEntry)
     }
 
     func contextWorkspaceRename() {
         guard let id = contextMenuWorkspace else { return }
         dismissContextMenu()
         beginRename(id: id, isWorkspace: true)
+    }
+
+    func contextWorkspaceCopyName() {
+        guard let id = contextMenuWorkspace else { return }
+        dismissContextMenu()
+        guard let name = store.workspaceName(id) else { return }
+        name.withCString { gdk_clipboard_set_text(gtk_widget_get_clipboard(W(window)), $0) }
+    }
+
+    func contextWorkspaceFocus() {
+        guard let id = contextMenuWorkspace else { return }
+        dismissContextMenu()
+        store.toggleFocusedWorkspace(id)
+        rebuildSidebar()
+    }
+
+    func contextWorkspaceFocusMembership() {
+        guard let id = contextMenuWorkspace else { return }
+        dismissContextMenu()
+        store.setFocusMembership(id, member: !store.focusedWorkspaceIDs.contains(id))
+        rebuildSidebar()
     }
 
     func contextWorkspaceDelete() {
@@ -318,7 +327,7 @@ extension AppController {
             return
         }
         if linuxSettingsStore().load().closeGraceUndoEnabled ?? true {
-            if store.softCloseSessions(targets) { reconcileSoftClose(preserving: targets) }
+            if store.softCloseSessions(targets) { reconcileSoftClose() }
         } else {
             for target in targets { store.closeSession(target) }
             reconcile()

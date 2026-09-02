@@ -47,10 +47,19 @@ public struct RecentClosedSession: Codable, Equatable, Sendable {
 public struct RecentClosedWorkspace: Codable, Equatable, Sendable {
     public let snapshot: WorkspaceSnapshot
     public let selectedSessionID: UUID?
+    /// Whether the workspace was a MEMBER of the sidebar focus set when it closed, so Reopen Closed Item can
+    /// mark it again instead of appending it invisibly behind a still-applied filter. Membership ONLY — the
+    /// filter FLAG is deliberately not recorded, being current window state rather than a property of the
+    /// closed workspace (see `AppStore.markFocusMember`). OPTIONAL because this struct persists in
+    /// `recent-closed.json`: a required key would fail the whole decode of an older file, and
+    /// `RecentClosedStore.load()` turns a decode failure into an EMPTY list — the user's entire recent list.
+    /// Absent (nil) reads as "not a member", the behavior of every pre-existing entry.
+    public let focusMember: Bool?
 
-    public init(snapshot: WorkspaceSnapshot, selectedSessionID: UUID?) {
+    public init(snapshot: WorkspaceSnapshot, selectedSessionID: UUID?, focusMember: Bool? = nil) {
         self.snapshot = snapshot
         self.selectedSessionID = selectedSessionID
+        self.focusMember = focusMember
     }
 }
 

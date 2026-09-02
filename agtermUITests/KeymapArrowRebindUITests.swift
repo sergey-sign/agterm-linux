@@ -1,16 +1,14 @@
 import XCTest
 
-/// Reproduction for issue #219: `map <chord> <action>` reportedly does nothing when the target action
-/// ships without a default chord. The four actions the report tested — `previous_session`,
-/// `next_session`, `previous_attention_session`, `next_attention_session` — are all in the six-member
-/// arrow-bound group (`defaultChord == nil`, a hardcoded arrow key-equivalent as the menu fallback via
-/// `agtermApp.arrowShortcut(for:)`). Uses the control socket to read the selected session by id, which is
-/// why it subclasses `ControlAPITestCase` (the `KeymapUITests` base can't reach the socket).
+/// Rebinding the six arrow-bound built-ins (`previous_session`, `next_session`, `focus_left_pane`,
+/// `focus_right_pane`, and the two attention-nav actions) — the group issue #219 reported as dead. They
+/// are ordinary `defaultChord`-driven actions now, rebindable to any chord including another arrow
+/// (issue #278). Uses the control socket to read the selected session by id, which is why it subclasses
+/// `ControlAPITestCase` (the `KeymapUITests` base can't reach the socket).
 @MainActor
 final class KeymapArrowRebindUITests: ControlAPITestCase {
-    // map `next_session` (one of the four reported arrow-bound actions) to a parseable chord and prove the
-    // chord actually navigates. two sessions so a single forward step never wraps to self, and the
-    // selection starts on the first so the step lands on the second (forward, unambiguous).
+    // two sessions so a single forward step never wraps to self, and the selection starts on the first so
+    // the step lands on the second.
     func testMapArrowNavActionFiresWhenSeededAtLaunch() throws {
         try relaunch(withKeymap: "map cmd+shift+a next_session\n")
         let sessionA = try activeSessionID()
@@ -22,7 +20,6 @@ final class KeymapArrowRebindUITests: ControlAPITestCase {
         _ = try sendCommand(#"{"cmd":"session.select","target":"\#(sessionA)"}"#)
         XCTAssertTrue(pollSelectedSession(sessionA, timeout: 10), "A should be selected before the chord")
 
-        // the mapped chord ⌘⇧A must fire next_session and move the selection A -> B.
         app.typeKey("a", modifierFlags: [.command, .shift])
         XCTAssertTrue(pollSelectedSession(sessionB, timeout: 10),
                       "the mapped chord ⌘⇧A should fire next_session and select B (issue #219)")
@@ -36,9 +33,47 @@ final class KeymapArrowRebindUITests: ControlAPITestCase {
                       "session.go next over the socket should select B (proves navigation is alive)")
     }
 
-    // the same rebind but applied via a LIVE `keymap.reload` (the exact path issue #219 used —
-    // `agtermctl keymap reload` while running), not seeded at launch. The menu items start with the
-    // hardcoded arrow key-equivalents, and reload must RE-REGISTER the mapped chord onto them.
+    // issue #278: the MENU half of arrow support (Chord "left" -> KeyEquivalent.leftArrow in `toShortcut`);
+    // the runner half is `KeymapUITests.testCustomCommandArrowChordFires`.
+    func testMapToAnArrowChordFires() throws {
+        try relaunch(withKeymap: "map cmd+shift+left next_session\n")
+        let sessionA = try activeSessionID()
+
+        let created = try sendCommand(#"{"cmd":"session.new"}"#)
+        let sessionB = try XCTUnwrap((created["result"] as? [String: Any])?["id"] as? String, "new session id")
+        XCTAssertTrue(pollSessionRowCount(2, timeout: 10), "should have two sessions")
+
+        _ = try sendCommand(#"{"cmd":"session.select","target":"\#(sessionA)"}"#)
+        XCTAssertTrue(pollSelectedSession(sessionA, timeout: 10), "A should be selected before the chord")
+
+        app.typeKey(.leftArrow, modifierFlags: [.command, .shift])
+        XCTAssertTrue(pollSelectedSession(sessionB, timeout: 10),
+                      "the mapped arrow chord ⌘⇧← should fire next_session and select B (issue #278)")
+    }
+
+    // `UndoCloseShortcut` is the other app-side NSEvent→Chord site and the only KEYBOARD path to undo_close
+    // — File ▸ Reopen Closed Item ships no key equivalent. Two constraints: a SINGLE-target control close
+    // takes the hard path and never arms the grace window, so TWO sessions are closed in one command; and
+    // the grace is 3 s (`AppStore.pendingCloseGraceInterval`), so nothing may poll or wait between the
+    // close and the chord.
+    func testMapToAnArrowChordFiresUndoClose() throws {
+        try relaunch(withKeymap: "map cmd+shift+up undo_close\n")
+
+        let first = try sendCommand(#"{"cmd":"session.new"}"#)
+        let idA = try XCTUnwrap((first["result"] as? [String: Any])?["id"] as? String, "session A id")
+        let second = try sendCommand(#"{"cmd":"session.new"}"#)
+        let idB = try XCTUnwrap((second["result"] as? [String: Any])?["id"] as? String, "session B id")
+        XCTAssertTrue(pollSessionRowCount(3, timeout: 10), "should have three sessions before the close")
+
+        _ = try sendCommand(#"{"cmd":"session.close","args":{"targets":["\#(idA)","\#(idB)"]}}"#)
+        app.typeKey(.upArrow, modifierFlags: [.command, .shift])
+
+        XCTAssertTrue(pollSessionRowCount(3, timeout: 10),
+                      "the mapped arrow chord ⌘⇧↑ should fire undo_close and restore the closed group")
+    }
+
+    // the live `keymap.reload` path issue #219 used, not a launch seed: the menu items start with their
+    // shipped arrow defaults, and the reload must RE-REGISTER the mapped chord onto them.
     func testMapArrowNavActionFiresAfterLiveReload() throws {
         let sessionA = try activeSessionID()
         let created = try sendCommand(#"{"cmd":"session.new"}"#)
@@ -61,16 +96,14 @@ final class KeymapArrowRebindUITests: ControlAPITestCase {
                       "session.go next over the socket should select B (proves navigation is alive)")
     }
 
-    // control for the live-reload path: a DEFAULT-chord action (new_session, ships ⌘N) rebound via the
-    // SAME live reload. If this fires but the arrow action above does not, the failure is specific to the
-    // arrow-bound actions' menu key-equivalent update; if both fail, live reload never re-registers a
-    // built-in menu shortcut at all.
+    // control for the live-reload path: if this fires but the arrow action above does not, the failure is
+    // specific to the arrow-bound actions' menu key-equivalent update; if both fail, live reload never
+    // re-registers a built-in menu shortcut at all.
     func testRebindDefaultChordActionFiresAfterLiveReload() throws {
         XCTAssertTrue(pollSessionRowCount(1, timeout: 10), "starts with the one seeded session")
 
         writeKeymapAndReload("map cmd+shift+y new_session\n")
 
-        // ⌘⇧Y must now fire new_session (a second row appears).
         app.typeKey("y", modifierFlags: [.command, .shift])
         XCTAssertTrue(pollSessionRowCount(2, timeout: 10),
                       "the live-reloaded chord ⌘⇧Y should fire new_session and add a session")

@@ -39,6 +39,57 @@ final class ControlSurfaceZoomUITests: ControlAPITestCase {
         XCTAssertTrue(pollSplitRatio(0.33, timeout: 10), "zoom round-trip must not change the split ratio")
     }
 
+    // promotion keeps the zoom target's semantic identity (`surface:<session>:left`), so the zoom host
+    // must replace its torn-down AppKit view itself or the zoom stays blank until the user exits it.
+    func testZoomedPrimaryExitRehostsAndFocusesPromotedSurvivor() throws {
+        let sessionID = try activeSessionID()
+        XCTAssertEqual(try sendCommand(#"{"cmd":"session.split","args":{"mode":"on"}}"#)["ok"] as? Bool, true,
+                       "split on should succeed")
+        XCTAssertTrue(try pollSplit(sessionID, timeout: 10), "the split should be live before zoom")
+
+        // Prove the future survivor's shell is ready before the one-shot primary exit.
+        let survivorReady = markerDir.appendingPathComponent("zoom-survivor-ready")
+        let survivorValue = try typeUntilMarker("printf ZOOMSURVIVOR > '\(survivorReady.path)'\n",
+                                                target: sessionID, file: survivorReady, select: false,
+                                                pane: "right", perAttempt: 3)
+        XCTAssertEqual(survivorValue, "ZOOMSURVIVOR", "the split survivor should be reading commands")
+
+        let leftSurface = try activeSurfaceID(kind: "left")
+        let zoom = try sendCommand(#"{"cmd":"surface.zoom","target":"\#(leftSurface)","args":{"mode":"show"}}"#)
+        XCTAssertEqual(zoom["ok"] as? Bool, true, "surface zoom show should succeed: \(zoom)")
+        XCTAssertTrue(app.buttons["terminal-zoom-exit"].waitForExistence(timeout: 10),
+                      "zoom should own the primary host before it exits")
+
+        // Confirm keyboard focus reached the zoomed primary before sending the non-repeatable `exit`.
+        let primaryReady = markerDir.appendingPathComponent("zoom-primary-ready")
+        var primaryValue: String?
+        for _ in 0..<4 where primaryValue == nil {
+            app.typeText("printf ZOOMPRIMARY > '\(primaryReady.path)'")
+            app.typeKey(.return, modifierFlags: [])
+            primaryValue = pollMarker(primaryReady, timeout: 3)
+        }
+        XCTAssertEqual(primaryValue, "ZOOMPRIMARY", "the zoomed primary should own keyboard focus")
+
+        app.typeText("exit")
+        app.typeKey(.return, modifierFlags: [])
+        XCTAssertTrue(poll(until: (try? sessionNodeIfPresent(id: sessionID)?["split"] as? Bool) == false, timeout: 15),
+                      "primary exit should promote the split survivor")
+        XCTAssertTrue(app.buttons["terminal-zoom-exit"].exists,
+                      "promotion should keep the semantic primary target zoomed")
+
+        // typed without clicking or leaving zoom: a stale representable still hosting the torn-down
+        // primary can never write this marker.
+        let afterPromotion = markerDir.appendingPathComponent("zoom-after-promotion")
+        var promotedValue: String?
+        for _ in 0..<4 where promotedValue == nil {
+            app.typeText("printf ZOOMPROMOTED > '\(afterPromotion.path)'")
+            app.typeKey(.return, modifierFlags: [])
+            promotedValue = pollMarker(afterPromotion, timeout: 3)
+        }
+        XCTAssertEqual(promotedValue, "ZOOMPROMOTED",
+                       "the promoted survivor should be hosted and focused without leaving zoom")
+    }
+
     func testScratchOpenedWhileZoomedRealizesSurface() throws {
         let leftSurface = try activeSurfaceID(kind: "left")
         let zoom = try sendCommand(#"{"cmd":"surface.zoom","target":"\#(leftSurface)","args":{"mode":"show"}}"#)
@@ -48,36 +99,36 @@ final class ControlSurfaceZoomUITests: ControlAPITestCase {
 
         let scratch = try sendCommand(#"{"cmd":"session.scratch","args":{"mode":"on"}}"#)
         XCTAssertEqual(scratch["ok"] as? Bool, true, "scratch on should succeed while zoomed: \(scratch)")
-        // the deck keeps realizing surfaces behind the zoom layer: the scratch must become readable
-        // (surface realized, shell spawned) without exiting zoom first.
         XCTAssertTrue(pollScratchReadable(timeout: 10),
                       "a control-opened scratch must realize its surface while the session is zoomed")
 
         XCTAssertEqual(try sendCommand(#"{"cmd":"surface.zoom","args":{"mode":"hide"}}"#)["ok"] as? Bool, true,
                        "zoom hide should succeed")
-        // hide is idempotent for explicit targets too: hiding an already-un-zoomed surface is an ok no-op.
         let rehide = try sendCommand(#"{"cmd":"surface.zoom","target":"\#(leftSurface)","args":{"mode":"hide"}}"#)
         XCTAssertEqual(rehide["ok"] as? Bool, true, "explicit-target hide should be idempotent: \(rehide)")
     }
 
-    func testQuickZoomEmitsAndAcceptsQuickTargetId() throws {
+    /// #441 detached the quick terminal into one per-app panel, so a bare zoom resolves inside the WINDOW
+    /// and can no longer pick it; `quick` stays reachable as an explicit target. `TerminalZoomTests` pins
+    /// the same split host-free.
+    func testQuickIsZoomableOnlyAsAnExplicitTarget() throws {
+        let leftSurface = try activeSurfaceID(kind: "left")
         XCTAssertEqual(try sendCommand(#"{"cmd":"quick","args":{"mode":"show"}}"#)["ok"] as? Bool, true,
                        "quick show should succeed")
 
         let zoom = try sendCommand(#"{"cmd":"surface.zoom","args":{"mode":"show"}}"#)
         XCTAssertEqual(zoom["ok"] as? Bool, true, "surface zoom show should succeed: \(zoom)")
-        XCTAssertEqual((zoom["result"] as? [String: Any])?["id"] as? String, "quick",
-                       "zooming with the quick terminal visible should target it: \(zoom)")
+        XCTAssertEqual((zoom["result"] as? [String: Any])?["id"] as? String, leftSurface,
+                       "a bare zoom must resolve within the window, never the detached quick panel: \(zoom)")
+        XCTAssertEqual(try sendCommand(#"{"cmd":"surface.zoom","args":{"mode":"hide"}}"#)["ok"] as? Bool, true,
+                       "zoom hide should succeed")
 
-        // the API must accept the address it just emitted: hide the zoom by its returned id.
-        let hide = try sendCommand(#"{"cmd":"surface.zoom","target":"quick","args":{"mode":"hide"}}"#)
+        let hide = try sendCommand(#"{"cmd":"surface.zoom","target":"quick","args":{"mode":"show"}}"#)
         XCTAssertEqual(hide["ok"] as? Bool, true,
-                       "the id surface.zoom emitted must be accepted back as a target: \(hide)")
+                       "quick must still be accepted as an explicit zoom target: \(hide)")
 
-        // zoom the quick terminal again and dismiss it with plain `quick hide`: dismissal must stay
-        // unconditional for scripts — a zoomed quick terminal exits its zoom first, never an error.
-        XCTAssertEqual(try sendCommand(#"{"cmd":"surface.zoom","args":{"mode":"show"}}"#)["ok"] as? Bool, true,
-                       "re-zooming the quick terminal should succeed")
+        // `quick hide` must stay unconditional for scripts — a zoomed quick terminal exits its zoom
+        // first, never an error.
         let quickHide = try sendCommand(#"{"cmd":"quick","args":{"mode":"hide"}}"#)
         XCTAssertEqual(quickHide["ok"] as? Bool, true,
                        "quick hide must succeed while the quick terminal is zoomed: \(quickHide)")
@@ -86,11 +137,8 @@ final class ControlSurfaceZoomUITests: ControlAPITestCase {
     }
 
     func testZoomedSurfaceTreeReadBackAndScopedErrorPaths() throws {
-        // unzoomed: the tree must OMIT zoomedSurface (nil closure result → key absent, not null).
         XCTAssertNil(try treeZoomedSurface(), "zoomedSurface should be absent while nothing is zoomed")
 
-        // zoom the active session's left surface and read the SAME id back from the tree top level —
-        // the record-then-restore leg of the write-only surface.zoom command.
         let leftSurface = try activeSurfaceID(kind: "left")
         let zoom = try sendCommand(#"{"cmd":"surface.zoom","target":"\#(leftSurface)","args":{"mode":"show"}}"#)
         XCTAssertEqual(zoom["ok"] as? Bool, true, "surface zoom show should succeed: \(zoom)")
@@ -101,18 +149,15 @@ final class ControlSurfaceZoomUITests: ControlAPITestCase {
                        "zoom hide should succeed")
         XCTAssertNil(try treeZoomedSurface(), "zoomedSurface should clear on zoom exit")
 
-        // error paths. a well-formed id whose session exists nowhere → no such surface.
         let ghost = "surface:00000000-0000-0000-0000-000000000000:left"
         let noSuch = try sendCommand(#"{"cmd":"surface.zoom","target":"\#(ghost)","args":{"mode":"show"}}"#)
         XCTAssertEqual(noSuch["ok"] as? Bool, false, "zooming an unknown surface should fail: \(noSuch)")
         XCTAssertEqual(noSuch["error"] as? String, "no such surface: \(ghost)")
 
-        // a malformed target → invalid surface.
         let invalid = try sendCommand(#"{"cmd":"surface.zoom","target":"not-a-surface","args":{"mode":"show"}}"#)
         XCTAssertEqual(invalid["ok"] as? Bool, false, "a malformed target should fail: \(invalid)")
         XCTAssertEqual(invalid["error"] as? String, "invalid surface: not-a-surface")
 
-        // a real surface addressed through a --window that does not own it → no such surface (scoped).
         let created = try sendCommand(#"{"cmd":"window.new","args":{"name":"zoom-err"}}"#)
         XCTAssertEqual(created["ok"] as? Bool, true, "window.new should succeed: \(created)")
         let otherWindow = try XCTUnwrap((created["result"] as? [String: Any])?["id"] as? String,
@@ -123,7 +168,7 @@ final class ControlSurfaceZoomUITests: ControlAPITestCase {
                        "zooming a surface through a window that does not own it should fail: \(wrongWindow)")
         XCTAssertEqual(wrongWindow["error"] as? String, "no such surface: \(leftSurface)")
 
-        // a known-but-CLOSED window → window not open (the resolver knows the id; there is no live store).
+        // the resolver still knows the closed window's id; there is just no live store behind it.
         XCTAssertEqual(try sendCommand(#"{"cmd":"window.close","target":"\#(otherWindow)"}"#)["ok"] as? Bool, true,
                        "closing the helper window should succeed")
         let closed = try sendCommand(
@@ -133,26 +178,24 @@ final class ControlSurfaceZoomUITests: ControlAPITestCase {
     }
 
     func testZoomingBackgroundTargetEndsItsSearch() throws {
-        // open search on session A (session.search selects its target, so A is active with the bar up).
+        // session.search selects its target, so A ends up active with the bar up.
         let sessionA = try activeSessionID()
         XCTAssertEqual(try sendCommand(#"{"cmd":"session.search","target":"\#(sessionA)","args":{"text":"login"}}"#)["ok"] as? Bool,
                        true, "opening search on session A should succeed")
         XCTAssertTrue(app.textFields["search-field"].waitForExistence(timeout: 10),
                       "the search bar should be up on session A")
 
-        // park the selection on a fresh session B, making A a BACKGROUND session with searchActive set.
         let created = try sendCommand(#"{"cmd":"session.new"}"#)
         XCTAssertEqual(created["ok"] as? Bool, true, "creating session B should succeed: \(created)")
 
-        // zoom A's surface by explicit id — the addressable path that does NOT select A first — then exit.
+        // by explicit id — the addressable path that does NOT select A first, so A stays background.
         let zoom = try sendCommand(#"{"cmd":"surface.zoom","target":"surface:\#(sessionA):left","args":{"mode":"show"}}"#)
         XCTAssertEqual(zoom["ok"] as? Bool, true, "zooming background session A's surface should succeed: \(zoom)")
         XCTAssertTrue(app.buttons["terminal-zoom-exit"].waitForExistence(timeout: 10), "zoom should be active")
         XCTAssertEqual(try sendCommand(#"{"cmd":"surface.zoom","args":{"mode":"hide"}}"#)["ok"] as? Bool, true,
                        "zoom hide should succeed")
 
-        // zoom-enter must have ENDED A's search: re-selecting A shows no search bar (a surviving
-        // searchActive would re-mount it the moment A becomes the active session).
+        // a surviving searchActive would re-mount the bar the moment A becomes active again.
         XCTAssertEqual(try sendCommand(#"{"cmd":"session.select","target":"\#(sessionA)"}"#)["ok"] as? Bool, true,
                        "re-selecting session A should succeed")
         XCTAssertTrue(app.textFields["search-field"].waitForNonExistence(timeout: 10),
@@ -160,7 +203,6 @@ final class ControlSurfaceZoomUITests: ControlAPITestCase {
     }
 
     func testBackgroundWindowZoomExitDoesNotStealFrontmostFocus() throws {
-        // zoom window A's left surface, then open window B on top: A becomes a BACKGROUND zoomed window.
         let windows = try XCTUnwrap(
             (try sendCommand(#"{"cmd":"window.list"}"#)["result"] as? [String: Any])?["windows"] as? [[String: Any]],
             "window.list should carry windows")
@@ -173,14 +215,12 @@ final class ControlSurfaceZoomUITests: ControlAPITestCase {
         XCTAssertEqual(created["ok"] as? Bool, true, "window.new should succeed: \(created)")
         let windowB = try XCTUnwrap((created["result"] as? [String: Any])?["id"] as? String,
                                     "window.new should return the new window id")
-        // wait for the second window to MATERIALIZE in the AX tree before driving it — a control-created
-        // window can lag its window.list "active" flag (the multi-window suites' count-poll pattern).
+        // a control-created window can lag its window.list "active" flag, so wait for the AX tree.
         let appeared = Date().addingTimeInterval(10)
         while Date() < appeared, app.windows.count < 2 { usleep(200_000) }
         XCTAssertGreaterThanOrEqual(app.windows.count, 2, "the second window should materialize and take key")
         XCTAssertTrue(pollWindowActive(windowB, timeout: 12), "the new window should take key")
 
-        // put the keyboard into window B's search field and prove it owns the keystrokes.
         XCTAssertEqual(try sendCommand(#"{"cmd":"session.search"}"#)["ok"] as? Bool, true,
                        "opening search in the frontmost window should succeed")
         let searchField = app.textFields["search-field"]
@@ -190,15 +230,57 @@ final class ControlSurfaceZoomUITests: ControlAPITestCase {
         XCTAssertTrue(pollFieldValue(searchField, equals: "ab", timeout: 8),
                       "the search field should own the keyboard before the background unzoom")
 
-        // un-zoom BACKGROUND window A over the socket. Its zoom-exit focus return is scoped to window A,
-        // so window B's field keeps the keyboard — a frontmost-targeted restore would steal it (the
-        // regression this pins). Give a stray restore its full retry window before typing on.
+        // A's zoom-exit focus return is scoped to window A; a frontmost-targeted restore would steal B's
+        // keyboard. The run-loop wait below gives such a stray restore its full retry window.
         XCTAssertEqual(try sendCommand(#"{"cmd":"surface.zoom","args":{"mode":"hide","window":"\#(windowA)"}}"#)["ok"] as? Bool,
                        true, "hiding the background window's zoom should succeed")
         RunLoop.current.run(until: Date().addingTimeInterval(1.0))
         app.typeText("cd")
         XCTAssertTrue(pollFieldValue(searchField, equals: "abcd", timeout: 8),
                       "a background window's zoom exit must not steal the frontmost window's keyboard focus")
+    }
+
+    // a pane overlay is addressable at `surface:<session>:overlay-right`, the id `surfaces[]` reports — the
+    // documented contract that a reported surface IS a zoom address. The round trip must also leave the
+    // overlay in its pane, not tear it down.
+    func testPaneOverlayZoomRoundTrip() throws {
+        let sessionID = try activeSessionID()
+        XCTAssertEqual(try sendCommand(#"{"cmd":"session.split","args":{"mode":"on"}}"#)["ok"] as? Bool, true,
+                       "split on should succeed")
+        XCTAssertTrue(try pollSplit(sessionID, timeout: 10), "the split should be live before the overlay opens")
+
+        let marker = markerDir.appendingPathComponent("zoom-pane-overlay")
+        let json = try! JSONSerialization.data(withJSONObject: [
+            "cmd": "session.overlay.open", "target": sessionID,
+            // APPENDS: a re-created (rather than re-hosted) surface would spawn a SECOND program and a
+            // truncating `>` would rewrite the same value, hiding the orphan behind a passing assertion.
+            "args": ["command": "sh -c 'printf OVERLAYUP >> \(marker.path); cat'", "pane": "right"]])
+        XCTAssertEqual(try sendCommand(String(data: json, encoding: .utf8)!)["ok"] as? Bool, true,
+                       "opening the right pane overlay should succeed")
+        XCTAssertEqual(pollMarker(marker, timeout: 15), "OVERLAYUP", "the pane overlay's program should run")
+
+        let overlaySurface = try activeSurfaceID(kind: "overlay-right")
+        XCTAssertEqual(overlaySurface.lowercased(), "surface:\(sessionID.lowercased()):overlay-right",
+                       "the reported surface id should be the documented zoom address")
+
+        let zoom = try sendCommand(#"{"cmd":"surface.zoom","target":"\#(overlaySurface)","args":{"mode":"show"}}"#)
+        XCTAssertEqual(zoom["ok"] as? Bool, true, "zooming the pane overlay should succeed: \(zoom)")
+        XCTAssertTrue(app.buttons["terminal-zoom-exit"].waitForExistence(timeout: 10),
+                      "the zoomed pane overlay should own the zoom host")
+        XCTAssertEqual(try treeZoomedSurface(), overlaySurface,
+                       "the tree's zoomedSurface must echo the zoomed pane overlay's id")
+
+        XCTAssertEqual(try sendCommand(#"{"cmd":"surface.zoom","args":{"mode":"hide"}}"#)["ok"] as? Bool, true,
+                       "zoom hide should succeed")
+        XCTAssertTrue(app.buttons["terminal-zoom-exit"].waitForNonExistence(timeout: 10),
+                      "hiding the zoom should return the overlay to the deck")
+        XCTAssertNil(try treeZoomedSurface(), "zoomedSurface should clear on zoom exit")
+        XCTAssertEqual(try sessionNode(id: sessionID)["paneOverlays"] as? [String], ["right"],
+                       "the pane overlay should still be up in its pane after the zoom round trip")
+        // the discriminating half of the append: exactly one program ran, so zoom RE-HOSTED the surface
+        // rather than building a second one and orphaning the first.
+        XCTAssertEqual(try String(contentsOf: marker, encoding: .utf8), "OVERLAYUP",
+                       "the zoom round trip must re-host the overlay's surface, never re-create it")
     }
 
     /// Polls `window.list` until the window with `id` reports active (frontmost/key) — a window.new/select

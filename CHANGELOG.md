@@ -1,5 +1,236 @@
 # Changelog
 
+## v0.24.0 - 2026-08-17
+
+### New Features
+
+- the quick terminal is a floating panel with a system-wide hotkey, so it can be summoned over any application and dismissed straight back to it. `keymap.conf` gains a `global-hotkey` verb for the chord #441 @umputun
+- keyboard navigation between workspaces: `previous_workspace` and `next_workspace` builtins, `workspace.go --to next|prev`, and `toggle_workspace_collapse` to fold the workspace you are in. All three ship keyless #436 @umputun
+- `session.overlay.copy` and `session.overlay.text` read an overlay's own surface. Both `session copy` and `session text` address the pane underneath, so a selection made inside an overlay used to read as `no selection` #437 @umputun
+- `surface.cursor` reports a surface's cursor column, printed as a bare number so it drops into a command substitution #451 @umputun
+
+### Improved
+
+- libghostty advances to upstream main, fixing a crash on surface teardown and lifting the pin held since April. Building now needs Zig 0.16 #449 @umputun
+- the shipped app drops three hardened-runtime exceptions it never used. The TCC entitlements are untouched #450 @umputun
+- `ControlServer` logs through `os.Logger`, so the control socket is queryable under the subsystem `docs/troubleshooting.md` tells you to filter on #442 @umputun
+- a cookbook recipe reporting a hook-driven agent's status onto its sidebar row when the agent runs inside a container #428 @nquo
+
+### Bug Fixes
+
+- an unattended restart lost every captured running command. The quit confirmation went up even for a quit the system asked for, and with nobody there to answer it the app was killed before it could save. Shutdown, restart and logout skip the prompt now, while a scripted quit still gets it. Reported by @ssgreg, who also sent the follow-up #446 #447 @umputun @ssgreg
+- two `keymap.conf` lines colliding on one chord were settled by file order, so reordering unrelated lines could silently take a custom command's shortcut away #444 @umputun
+
+## v0.23.0 - 2026-08-13
+
+### New Features
+
+- splits can run top and bottom, not only side by side. `⌘⇧D` splits horizontally and `⌘D` keeps the vertical one, each action creating, revealing, hiding or transposing as needed, so a live split changes orientation without recreating either terminal. `session.split` and `agtermctl` take an optional `vertical`/`horizontal` axis, `top`/`bottom` join `left`/`right` as pane aliases, and the axis survives restore. Dashboard moves to `⌘⇧G` #427 @umputun
+- Close Split tears a split pane down, from the palette and as `session.split.close`. ⌘D only hid one: `hasSplit` stayed set and the shell behind it stayed alive, so the only teardown was typing `exit` in the pane, which does nothing for a shell inside docker, an ssh or an agent sitting past a prompt. The palette row shows whenever a split exists, so a hidden pane is reachable #421 @umputun
+- a `map` or `command` line in `keymap.conf` can carry several alternative keybinds separated by `|`, so a mac-native chord and a tmux-style leader sequence can both reach one action instead of forcing a choice. It also gives built-in actions their first leader sequence: they dispatch as menu key equivalents and `NSMenuItem` holds exactly one character, so the parser used to reject one outright #420 @umputun
+
+### Improved
+
+- a cookbook recipe listing the SQLite databases in the session's repo in the native picker, newest first with size and age, opening the pick in tabiew. Files are matched on the SQLite magic header rather than the extension, and dependency directories are pruned as a rule #426 @umputun
+- a cookbook recipe listing the repo's `docs/backlog` items in the picker and handing the pick to Claude Code as `/backlog <slug>`, each row carrying the item's triage call, age and location #422 @umputun
+- a cookbook recipe opening the pane's selection, or its last 50 lines when nothing is selected, in revdiff inside an overlay, pasting the notes back at the prompt with each one quoting the line it hangs on. Where annotate-claude-replies reads Claude's own transcript, this reads the terminal, so it works on any agent, a stack trace or a `terraform plan` #419 @umputun
+- README is a product synopsis again rather than the full reference, with the depth it carried moved onto the site's docs page #424 @umputun
+
+### Bug Fixes
+
+- a session created while the display was asleep never started, so a scheduled job's `--command` never ran although `session new` had already answered `ok`. `ghostty_surface_new` returns NULL for as long as the display sleeps, measured at 21 consecutive failures over 40s with a valid backing size, and nothing re-attempted, because the deck's retries ride SwiftUI layout and that does not run for an off-display window. Creation retries on display wake now, and `tree` reports `realized` per session #417 @umputun
+- `session.paste`, `session.selectall` and `session.copy` answered as though they had acted when the target pane had no terminal behind it, the state a session sits in while the display sleeps. All three checked only that the surface slot was filled, which a parked view passes, so a script branching on the error text took the wrong branch or believed a paste that never happened. All three report `session not realized` now #425 @umputun
+- a second instance resolving the same socket path took the running app's control socket for good, and only a restart recovered it. Ownership is an exclusive `flock` now rather than the unconditional unlink before `bind`, and a refused instance advertises `<socket>.unavailable`, so the shells it spawns cannot reach the owner's terminal #418 @umputun
+- a tool capturing system audio inside a session got silence and no permission prompt. Core Audio process taps go through TCC's audio-capture service, macOS holds agterm responsible for whatever it spawns, and the Info.plist carried no `NSAudioCaptureUsageDescription`, so `tccd` refused to prompt and left nothing to grant by hand in System Settings either #432 @umputun
+- the Install Agent Status Hooks alert could grow past the bottom of the screen, taking its OK button with it, `NSAlert` sizing itself to fit text it will not scroll. The two Codex manual-merge cases embedded the full 29-line hooks block; every outcome is one short sentence now, with an Open Docs button where the printed steps used to be #430 @umputun
+
+## v0.22.0 - 2026-08-09
+
+### New Features
+
+- voice dictation and other assistive tools work over the terminal. MacWhisper's hold-to-dictate widget never appeared in agterm though it does in NSTextView-based terminals: the Metal-backed surface was absent from the accessibility tree, and such tools probe `AXFocusedUIElement` for a focused text field before engaging, finding nothing at all over agterm. The interactive surface now reports itself as the minimal shape of an editable text field #246 @pbldbl
+- `session hud --position` takes the nine anchors of a 3x3 grid, spelled exactly as `session background` spells them, so a panel can sit in a corner instead of over the text being read, and every anchor off center holds a fixed edge margin on each axis it names. The bare `top` and `bottom` it shipped with stay accepted as aliases for the middle column and normalize on read-back, so existing callers keep working and `tree` reports one spelling. `hud update` also recolors the panel's text in place #386 @umputun
+- a workspace or session row's name can be copied from the sidebar context menu. The row's text field is not selectable outside rename mode, so reading a name to reuse elsewhere meant retyping it or entering rename mode and copying out of the field, which risks committing an edit to a name you only wanted to read #385 @skkap
+
+### Improved
+
+- `tree` reports `hasSplit` beside `split`, so a caller can tell a session with a hidden second pane from one with no split at all. `split` means the split is shown side by side, and a pane hidden with ⌘D read as `false` there while `splitRatio` and `splitFocused` stayed populated beside it; `agtermctl tree` tags that case `(split hidden)` a585694 @umputun
+- a cookbook recipe that lists a session directory's past Claude Code conversations in the native picker, each named for what it turned out to be about rather than its opening prompt, and types the resume into the pane the chord fired from #381 @umputun
+- a cookbook recipe that reopens each tab's own Kimi Code conversation after a restart, completing the session-resume family. Kimi's SessionStart hook receives the new conversation's id, so the recipe pins the tab's restore command from the hook instead of wrapping the launch #391 @x9x9x9x9x9x91
+- a cookbook recipe joining Kiro CLI to the agent-status integration. Kiro declares hooks per agent with no global file, so it is the one agent that cannot reach the sidebar glyph through the bundled adapters #383 @bitcldr
+- a cookbook recipe that syncs the active pane's working directory to the other half of a split, splitting first when none is shown, and refusing when the target pane is running a foreground program #388 @vladislav-yevtushenko
+- the annotate-claude-replies recipe dropped revdiff's file-level notes, its header regex requiring a `:line` part that a file-level note does not carry #387 @denysshnurenko
+
+### Bug Fixes
+
+- a command-line tool run inside a session could never be granted Automation, Camera, Contacts, Calendars, Location or Photos. Under hardened runtime those services need an entitlement the app did not carry, and macOS treats agterm as the responsible process for everything it spawns, so `tccd` refused to prompt and recorded nothing. No dialog appeared, and with no record there was no entry in System Settings to grant by hand either. Grants agterm already held kept working, which is what made this easy to miss. The bundled `agtermctl` also stopped inheriting the app's entitlement set, which the build's re-seal had been stamping onto it #398 @skkap
+- the View menu showed two full screen items, agterm's own and AppKit's, both carrying the same icon as Toggle Terminal Zoom. AppKit appends its item as the menu is prepared for display and the documented opt-out is ignored on macOS 26, so agterm's own item is gone instead and a key monitor keeps its chord #412 @umputun
+- ⌘W with the Settings window open closed the active terminal session instead of Settings, and the same for the About and Open Directory panels. File ▸ Close Session is a main-menu item with no window scoping, so the keystroke reached the terminal deck whichever window was key #403 @umputun
+- a custom command bound in `keymap.conf` could not run a bare `agtermctl` or a bare Homebrew binary. It spawns as a detached `/bin/sh -c` inheriting launchd's `PATH`, and that is neither a login nor an interactive shell, so the command exited 127 with the shell's own diagnostic discarded #395 @umputun
+- a selected row at the bottom of the command palette painted over the panel's rounded corner and squared it off: the panel drew a rounded background and a stroke but never clipped to either. The `pick` free-text path showed it on every press that matched nothing #415 @umputun
+- palette rows have been full-width click targets since they were built, but nothing painted under the pointer, so there was no way to tell what a click would run without clicking it #414 @umputun
+- clicking a workspace row expanded or collapsed it without animation while the disclosure triangle beside it animated, so one toggle rendered two ways depending on where it was hit #413 @umputun
+- the starter `keymap.conf` suggested uncommenting `map cmd+shift+d toggle_split`, a line that can never apply: `cmd+shift+d` is the dashboard's own default, so the override is dropped as a built-in collision. Both examples now use a free chord, and the header points at where a skipped line is reported #411 @umputun
+- a literal substring match in a long path could rank below a scattered match on another row, the substring band being unbounded and able to score past the subsequence floor #390 @x9x9x9x9x9x91
+
+## v0.21.0 - 2026-08-06
+
+### New Features
+
+- the command palette, the control-API picker and the Ctrl-Tab switcher rendered at a hardcoded 13pt with no way to change them. A new Settings ▸ Interface font size (9...20, default 13) drives all three plus the title-bar popover rows, separate from the sidebar's own size and with no fallback between them, since the sidebar is a density knob and the palette a readability one. All three now center over the terminal area rather than the whole window, which read as off-center whenever the sidebar was up, and each panel is bounded against the window so a cramped one degrades to whole-window centering instead of clipping #367 @umputun
+- `session.hud` posts a small floating panel over a session while an agent prepares something slow: computing picker items, spawning an overlay program, waiting on a network call. It shows a message, an optional detail line and an optional spinner, and updates or closes from a later call. The panel is passive, so the session keeps first responder and typing into the terminal underneath still works #361 @umputun
+
+### Improved
+
+- a fish port of the claude-session-resume cookbook recipe, so a fish user gets the same per-tab conversation resume the existing versions give #365 @Arelav
+- a cookbook recipe that opens Claude's replies in revdiff for inline annotation and sends the notes back #364 @p4elkin
+
+### Bug Fixes
+
+- a dark launch with a conditional `theme = light:X,dark:Y` spawned every restored surface with no `AGTERM_*` variables, no restore replay and no `session new --command`; only the cwd survived. The renderer rebuilds a surface's config whenever the app's conditional state disagrees with the config's, and that rebuild replays the config files alone, dropping the per-surface environment, initial input and command the host set. A host-built config always resolves light while the app is already dark, so the two disagree at launch and agree later, which is why this looked specific to restore. The app config is now re-sided before any scene mounts #378 @umputun
+- with Restore running commands on restart enabled, quitting by closing the window lost every captured command and each pane came back a plain shell: the close tore each surface down before the quit-time capture could read it, so the save persisted nulls. ⌘Q was unaffected. Closing a window that was not the last captured nothing at all #370 @i-kozlov
+- a captured foreground command could replay on more than one launch, re-running the program every time until it was cleared by hand a8b5252 @umputun
+- exiting by closing every window brought back the wrong window on the next launch: a multi-window user got window 1 rather than the one he was working in, because closing the last window dropped the record of which was frontmost #377 @umputun
+- ⌘D, the title-bar split button, View ▸ Split and the palette each flipped the split behind a shown scratch pane. The screen could not change, so the only sign was the glyph moving, and the layout you came back to was not the one you left. The press now dismisses the scratch, the same cover-first rule ⌘W already uses, and a second press splits #376 @umputun
+- ⌘C with nothing selected typed a stray key report into the running program, which shows up in Claude Code and other TUIs that turn the kitty keyboard protocol on. The Edit menu disables Copy without a selection, so the press reached the key binding, failed to perform and fell through to key encoding. It is not layout-specific, contrary to how the report scoped it #375 @umputun
+- with Settings ▸ Appearance ▸ Window ▸ Toolbar set to Hidden, a 1px line ran across the top edge of the window, most visible in native fullscreen on a notched display where it separated the black band from the terminal. It is the separator that belongs under the custom titlebar row, which has no height in that mode, and the dashboard drew its own copy in the same place #379 @umputun
+- an unrecognized value in `workspaces.json`, written by a newer build or a hand edit, failed the whole snapshot decode, and the recovery path starts fresh: every workspace and session was wiped over one non-essential display field. Each optional now drops to nil on its own instead of taking the tree with it #363 @x9x9x9x9x9x91
+- a non-interactive fish `claude` call did not pass through to the real binary, so anything scripting it broke under the session-resume wrapper #366 @Arelav
+
+## v0.20.2 - 2026-08-03
+
+### Improved
+
+- double-clicking the divider between two split panes snaps the split back to even. A drag can never hit exactly 50/50, and the gesture is recognized only on the pixels the split already owns for its own drag, so word selection in the terminal is untouched. A re-grab after a nudge-drag, which macOS also reports as a double-click, does not throw the adjustment away #357 @umputun
+- a cookbook recipe that grids the flagged sessions' panes that are running something, on one chord. The unit is a pane, so a split whose left half sits at a prompt while its right runs a build contributes one cell, and pressing the chord again closes the grid #355 @umputun
+
+### Bug Fixes
+
+- a pane started with `session new --command` always read as idle in `tree --json`: its `foreground` was omitted however hard the program worked, so nothing driving the control API could tell a busy agent session from an empty shell. Such a pane has no job-control shell, so its program stays in the process group led by setuid-root `login`, whose argv is refused to a non-root caller. The tree read now descends the group to the first readable member, while the quit-time restore capture deliberately does not, so a `--command` session still restores through the exec path with its `--wait` hold intact #358 @umputun
+- a pane overlay opened on the unfocused side of a split rendered at full brightness, so both panes read as live and the split focus cue was gone. The overlay now carries the same wash an inactive pane gets, blended against the overlay's own background rather than the session's, so an overlay opened with `--background-color` fades its text instead of shifting its background #356 @umputun
+- an interior newline in a session, workspace or window name, or in a session's `--cwd`, survived into the stored value and expanded unquoted into the `/bin/sh -c` line of a custom command through the `{AGT_SESSION_NAME}` / `{AGT_SESSION_PWD}` / `{AGT_WORKSPACE_NAME}` / `{AGT_WINDOW_NAME}` tokens, where a newline separates statements. The OSC path already sanitized these values; the control-socket and GUI rename paths trimmed surrounding whitespace only #354 @x9x9x9x9x9x91
+
+## v0.20.1 - 2026-08-02
+
+### Improved
+
+- Settings ▸ General fits without scrolling again: the caption under the workspace row-click toggle is gone. It spelled out that the disclosure triangle keeps working either way, which the section did not need a whole line to say b35dd34 @umputun
+
+## v0.20.0 - 2026-08-02
+
+### New Features
+
+- overlays can cover one pane of a split instead of the whole session: `session overlay open|close|result` take `--pane left|right`, the sibling pane stays visible and interactive, and both panes can hold their own overlay with its own command, cwd and background color. Pane overlays are always full-pane, so `--pane` is rejected with `--size-percent` and `session overlay resize` takes none #343 @umputun
+- `agtermctl dashboard` accepts a `:left` or `:right` suffix on each positional id, so one pane of a split can go on the grid instead of the session always contributing both. It is the same form `tree --json` reports in `dashboardMembers`, so write and read round-trip, and it composes with any head #334 @umputun
+- caller-supplied pickers match a row's label only and never its subtitle, closing a path where typing a refusal filtered the safe row out and left the destructive one preselected. An empty query now keeps the caller's item order instead of re-sorting alphabetically, `--query` prefills the field, and a picker with no items is allowed #339 @umputun
+- clicking anywhere on a workspace row toggles its expansion, behind a new Settings ▸ General ▸ Mouse toggle that is on by default. The disclosure triangle is untouched and works either way #342 @umputun
+- a first launch on a machine opens a welcome alert naming the Help menu's optional installers, with two checkboxes that install the agent skill and the agent status hooks in one pass, because nothing else tells a new user they exist #353 @umputun
+
+### Improved
+
+- a cookbook recipe that picks a project in the native picker and opens a session in its workspace, creating that workspace when it does not exist, and hands a prompt typed after the project's name to a configured command #352 @x9x9x9x9x9x91
+- a cookbook recipe that lists what the Claude Code run in a session was working on, newest first, in a floating overlay, each item an age, a title, a one-sentence detail and a status #345 @umputun
+- a cookbook recipe joining Kimi Code to the agent-status integration, so its sessions report status onto their sidebar row with the stock hook script and four config entries #336 @x9x9x9x9x9x91
+- the opencode session-resume recipe's removal step and Usage paragraph named a flat state path while the function honors `$XDG_STATE_HOME`, so a reader with a custom state home cleaned the wrong directory and left his bindings behind. Both now name the path the function actually uses, and the `--session` passthrough claim is corrected #330 @cherkale
+
+### Bug Fixes
+
+- typing into a session right after `session new --no-select` failed with "session not realized", because the reply came from a synchronous store mutation that raced the mount and layout gap. The main pane now runs the same bounded poll with or without select, so the select-then-reselect workaround, which tears down the workspace focus filter and rewrites recency, is no longer needed #351 @umputun
+- hovering the divider between two split panes showed the terminal's I-beam instead of the resize cursor, in any window with more than one session. Dragging always worked and only the pointer feedback was wrong; #324 fixed the flicker, but its fix held only while a single session was mounted #344 @umputun
+- `agtermctl` died on signal 13 with no output when a request went over the server's 1 MiB cap. The client fd never set `SO_NOSIGPIPE`, so it took the signal before it could read the server's "request too large" reply #340 @x9x9x9x9x9x91
+- a session's blinking status glyph strobed instead of pulsing when its terminal title updated rapidly, as Codex CLI does every ~100ms while working. The row builder reset every recycled cell to an idle indicator before re-applying the real one, which restarted the fade each time #335 @umputun
+
+## v0.19.1 - 2026-07-31
+
+### Improved
+
+- a floating overlay and the quick terminal now mute the session behind them, the same wash an inactive split pane already gets and at the strength already in Settings, so a panel reads as sitting over the terminal rather than as part of it. A full-size overlay and the scratch pane hide their panes outright and take no wash #327 @umputun
+- a cookbook recipe for the native picker that shipped in 0.19.0: press a chord and agterm's own fuzzy picker lists directories under your search roots, then types the pick into the session you pressed the key in, trailing slash and no Return #320 @umputun
+- a third session-resume cookbook recipe next to the Claude Code and Codex ones, so each tab reopens its own opencode conversation after a restart #328 @cherkale
+
+### Bug Fixes
+
+- creating a workspace never moved the target, so a new one was never current while any session was selected: File ▸ Rename Workspace edited the workspace you came from, ⌘N put the new session there too, and `agtermctl session new --workspace active` right after `workspace new` targeted the previous one. A new workspace now holds the target until the selection moves to a different session, and `workspace select` retargets even when the workspace it names already owns the selection #329 @umputun
+- hovering the sidebar handle or a split divider only flashed the resize cursor, which then alternated with the terminal's I-beam on every mouse move. Dragging worked, only the pointer feedback was broken; a regression from #207 #326 @umputun
+- narrowing the sidebar could leave the window drawing a session no row pointed at: focusing a workspace that does not own the active session, applying the workspace filter while its workspace is unmarked, switching to the flagged view while the session is not flagged, or unflagging it there. The selection now moves to the most recent session still visible #322 @umputun
+
+## v0.19.0 - 2026-07-29
+
+### New Features
+
+- a native picker any script can drive: `agtermctl pick` takes choices on stdin as plain lines or JSON, shows them in the same fuzzy palette the app uses, and prints back the one chosen, so a shell script can ask a question without drawing its own UI. Blocking and non-blocking forms, optional free-form answers, per-window targeting, `pick result`/`pick cancel` for the non-blocking case, and a `pickPending` read-back on `tree` #316 @umputun
+- the agent skill also ships as a Claude Code and Codex plugin, installable with `plugin marketplace add umputun/agterm` instead of only from Help ▸ Install Agent Skill…. One directory feeds the app bundle and both plugin managers, so anyone whose agent config lives outside `~/.claude` or `~/.codex` gets an install their agent can actually find #318 @umputun
+- OpenCode joins Claude Code, Codex and Pi in the agent-status integration. A bundled lifecycle plugin marks a session active while it works, blocked when it asks permission or hits an error, and completed when it settles, tracking child sessions so a subagent finishing does not clear a still-busy parent #289 @culler127
+- New Window in the Dock menu, so a window can be opened without bringing agterm forward first. Unlike the other Dock items it belongs to no window, so it stays available whatever the last-active one is doing #319 @umputun
+
+### Improved
+
+- a workspace in the focus set draws the grid glyph at heavy weight rather than filled, so a marked workspace keeps one identity whether marked or not and no longer reads like a flagged session 6d403ae @umputun
+- two more cookbook recipes: switching the sidebar between named groups of workspaces on one chord, and speaking agent status changes from a dedicated session #307 #308 @umputun
+- a cookbook recipe that picks a workspace with fzf and starts a session in it #311 @skripalschikov
+
+### Bug Fixes
+
+- keybindings from `keymap.conf` did nothing on a non-English keyboard layout. Custom commands and ⌘Z undo-close matched the character the active layout produces, so on a Cyrillic layout the physical O key yields `щ` and a Latin-spelled `cmd+o` could never match. Chords now resolve per layout, binding by physical position on layouts that cannot type ASCII #310 @umputun
+- a program that colors the terminal background and restores it on exit left the pane stuck on its color, because agterm honored OSC 11 to set the background but not OSC 111 to reset it #312 @umputun
+- the Action Palette flickered while arrow keys moved the selection, repainting the whole list and re-running a scroll animation on every keypress #314 @umputun
+
+## v0.18.1 - 2026-07-28
+
+### Improved
+
+- a `cookbook/` of installable `agtermctl` recipes: show one project's workspaces and hide the rest, snapshot a project and bring it back later, park every window but one in the Dock, pick a path in an overlay and type it into the session, open TUI launchers in an overlay or a split, and resume a Claude Code or Codex conversation per tab; each recipe carries its own README, its scripts, and the minimum agterm version it needs, and the repo now has a `CONTRIBUTING.md` #305 @umputun
+
+### Bug Fixes
+
+- a session was left showing a blank pane that took no keyboard input when the primary shell exited while a split was hidden, with the hidden split's shell still running and reachable from neither pane; the survivor was promoted in the model but the view kept hosting the torn-down surface #304 @umputun
+
+## v0.18.0 - 2026-07-27
+
+### New Features
+
+- the sidebar focus filter now marks a set of workspaces instead of a single one, and the marked set survives turning the filter off, so a working set can be built member by member and the whole tree is one toggle away instead of a lost selection; a marked row draws the filled grid icon, the row context menu toggles membership, a bottom-bar button applies or suspends the filter, and `agtermctl workspace filter` plus the new `workspace focus add` mode drive both halves with per-workspace read-back on `tree` #297 @umputun
+- `agtermctl keymap list` reports what a keybinding actually resolved to, the read side of `keymap reload`: every built-in action with its chord and whether it was overridden, keyless actions included so free chords are visible, alongside the key equivalents the live menu bar carries with their submenu path and enabled state, plus the config path, custom commands, and parse diagnostics with line and message; both halves render in the same syntax, so a binding that does not fire can be diagnosed by comparing them instead of pressing keys and reporting what happened #301 @umputun
+
+### Improved
+
+- the dashboard button is easier to tell apart from the workspaces glyph: the two were different symbols but both a 2x2 arrangement inside a square, close enough to be confused at title-bar and menu size, so the dashboard now carries a wider 2x2 split 5353785 @umputun
+
+### Bug Fixes
+
+- ⌘W closed the whole window instead of the active session once `close_session` had been rebound away from ⌘W and back again, and only a relaunch cleared it; the chord is now asserted from AppKit at launch, on keymap change, on activation, and on menu tracking, rather than waiting for a menu rebuild that never came #298 @umputun
+
+## v0.17.1 - 2026-07-25
+
+### Improved
+
+- windows can be parked in the Dock over the control API with `agtermctl window minimize` (explicit `on`/`off`/`toggle`), created already parked with `window new --minimized`, and read back through the `minimized` field on `window list`, so a script can show one project's window and hide the rest #294 @umputun
+
+### Bug Fixes
+
+- `window new` replied before its window had attached, so an immediate `window resize` on the returned id failed with `window not open` #294 @umputun
+- `window list` served a stale cache that never refreshed once a window attached, so a newly created window reported no geometry indefinitely #294 @umputun
+- minimizing the frontmost window left it marked frontmost, so `tree`, `session new`, `quick`, and the palette kept routing into a window sitting in the Dock #294 @umputun
+- `window select` reported success without taking frontmost while the app was inactive, which is the state a driving script runs in #294 @umputun
+
+## v0.17.0 - 2026-07-25
+
+### New Features
+
+- an application Dock menu with New Session, Quick Terminal, and Dashboard, plus the window's recent sessions and the ones needing attention, so common actions and session jumps work from the Dock without bringing a window to the front #284 @melonamin
+- selectable shapes for the agent-status glyphs, so blocked, active, and completed differ by silhouette instead of hue alone; picked per status in Settings ▸ Agent Status, or per call with `agtermctl session status --shape` #292 @umputun
+- arrow keys are now part of the keymap chord grammar, so a binding like `map cmd+shift+left previous_session` works; the six actions that already shipped on arrows report their real chords, which also makes them visible to the conflict checker instead of silently double-binding #291 @umputun
+- an opt-in Settings ▸ Interface toggle to show the sidebar only in the active window, collapsing it in the others so a multi-window layout spends its width on terminals #285 @umputun
+- hovering a sidebar agent-status glyph now names the status it stands for #283 @umputun
+
+### Bug Fixes
+
+- honor the macOS Reduce Motion and Reduce Transparency accessibility settings #279 @melonamin
+- a Codex session is marked blocked when its final assistant message asks a question anywhere in the text, not only when it ends in one #282 @umputun
+- a notification banner suppressed because its session is already visible now says so in the log and in the control response, instead of reporting a delivered banner #287 @umputun
+- renaming a session from the menu bar, the palette, or a keybinding no longer starts an inline edit in every other open window, which left a stray editor holding focus there and permanently wedged idle auto-follow off #295 @umputun
+- `agtermctl session focus --pane` now moves focus in a background window while the frontmost window has its quick terminal showing, instead of silently reporting success without moving it f2745a8 @umputun
+
 ## v0.16.1 - 2026-07-22
 
 ### Bug Fixes

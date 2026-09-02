@@ -23,14 +23,21 @@ final class UndoCloseShortcut {
     private func handleKeyDown(_ event: NSEvent) -> Bool {
         guard actions.store?.pendingCloseSummary != nil else { return false }
         guard NSApp.keyWindow?.firstResponder is NSText == false else { return false }
-        guard let chord = chord(from: event) else { return false }
-        let expected = actions.settingsModel?.keymap.equivalent(for: .undoClose) ?? BuiltinAction.undoClose.defaultChord
-        guard chord == expected else { return false }
+        guard let chord = chord(from: event), matchesUndoCloseChord(chord) else { return false }
         actions.undoClose()
         return true
     }
 
-    private func chord(from event: NSEvent) -> Chord? {
+    /// Whether `chord` is what `undo_close` is bound to right now. A wired keymap answering nil means a `map`
+    /// line left the action explicitly unbound, so NOTHING matches — only an unwired settings model falls back
+    /// to the shipped ⌘Z. Internal so a hosted test can drive the decision without a pending close.
+    func matchesUndoCloseChord(_ chord: Chord) -> Bool {
+        let expected = actions.settingsModel.map { $0.keymap.equivalent(for: .undoClose) }
+            ?? BuiltinAction.undoClose.defaultChord
+        return expected == chord
+    }
+
+    func chord(from event: NSEvent) -> Chord? {
         var mods: Modifier = []
         let flags = event.modifierFlags
         if flags.contains(.control) { mods.insert(.control) }
@@ -38,16 +45,15 @@ final class UndoCloseShortcut {
         if flags.contains(.option) { mods.insert(.option) }
         if flags.contains(.shift) { mods.insert(.shift) }
 
-        let key: String?
-        switch event.keyCode {
-        case 36: key = "return"
-        case 48: key = "tab"
-        case 49: key = "space"
-        case 51: key = "delete"
-        default:
-            key = event.charactersIgnoringModifiers?.lowercased()
-        }
-        guard let key, key.count == 1 || ["return", "tab", "space", "delete"].contains(key) else { return nil }
+        // a layout that cannot type ASCII resolves to the Latin key at the same physical position, so ⌘Z still
+        // reopens a closed item on a Cyrillic layout (where that key types `я`). unlike
+        // `CustomCommandRunner.chord(from:)` the produced character here KEEPS shift (`shift+/` reports `?`),
+        // so a shifted-symbol chord does not match on a Latin layout — pre-existing, and why this monitor's
+        // `NSEvent` seam is the testable one (a synthesized event reports this accessor verbatim).
+        let key = namedKey(forKeyCode: event.keyCode)
+            ?? chordKey(forKeyCode: event.keyCode, produced: event.charactersIgnoringModifiers,
+                        layoutIsASCIICapable: KeyboardLayout.isASCIICapable)
+        guard let key, key.count == 1 || bindableNamedKeys.contains(key) else { return nil }
         return Chord(mods: mods, key: key)
     }
 }

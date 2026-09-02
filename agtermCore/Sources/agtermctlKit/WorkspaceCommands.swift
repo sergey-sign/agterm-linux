@@ -6,7 +6,7 @@ import agtermCore
 struct Workspace: ParsableCommand {
     static let configuration = CommandConfiguration(
         abstract: "Workspace commands.",
-        subcommands: [New.self, Rename.self, Delete.self, Select.self, Move.self, Focus.self,
+        subcommands: [New.self, Rename.self, Delete.self, Select.self, Go.self, Move.self, Focus.self, Filter.self,
                       Collapse.self, Expand.self]
     )
 
@@ -53,6 +53,20 @@ struct Workspace: ParsableCommand {
         }
     }
 
+    /// `agtermctl workspace go --to next|prev` — steps the CURRENT workspace and selects its first session.
+    /// Deliberately NO `--target`: it is relative to what is current, the shape `session go` takes, not the
+    /// `workspace.*` target commands. `move` is the neighbouring verb that REORDERS instead.
+    struct Go: RequestCommand {
+        static let configuration = CommandConfiguration(commandName: "go",
+            abstract: "Navigate workspaces: next|prev.")
+        @Option(name: .long, help: "Direction: next or prev.") var to: String
+        @OptionGroup var options: ClientOptions
+
+        func makeRequest() throws -> ControlRequest {
+            ControlRequest(cmd: .workspaceGo, args: options.withWindow(ControlArgs(to: to)))
+        }
+    }
+
     struct Move: RequestCommand {
         static let configuration = CommandConfiguration(abstract: "Reorder a workspace among its siblings.")
         @Option(name: .long, help: "Direction: up, down, top, or bottom.") var to: String
@@ -64,10 +78,41 @@ struct Workspace: ParsableCommand {
         }
     }
 
+    /// `agtermctl workspace focus [on|off|toggle|add] [--target W]` — marks or unmarks ONE workspace in the
+    /// sidebar's focus set; `add` only marks, applying the set is `workspace filter on`. The accepted list, the
+    /// per-mode help prose, and the rejection message all derive from `ControlWorkspaceFocusMode.allCases` (via
+    /// `validNamesList`/`helpPhrase`/`validNamesPhrase`), so a new case reaches each and cannot drift from it.
     struct Focus: RequestCommand {
-        static let configuration = CommandConfiguration(abstract: "Focus the sidebar on a single workspace (on|off|toggle).")
-        @Argument(help: "Mode: on (focus), off (unfocus), or toggle (default).") var mode: String = "toggle"
+        static let configuration = CommandConfiguration(
+            abstract: "Mark a workspace in the sidebar focus set (\(ControlWorkspaceFocusMode.validNamesList))."
+        )
+        @Argument(help: "Mode: \(ControlWorkspaceFocusMode.helpPhrase).")
+        var mode: String = ControlWorkspaceFocusMode.toggle.rawValue
         @OptionGroup var target: TargetOptions
+        @OptionGroup var options: ClientOptions
+
+        func validate() throws {
+            guard ControlWorkspaceFocusMode(rawValue: mode) != nil else {
+                throw ValidationError("mode must be one of: \(ControlWorkspaceFocusMode.validNamesPhrase)")
+            }
+        }
+
+        func makeRequest() throws -> ControlRequest {
+            ControlRequest(cmd: .workspaceFocus, target: target.target, args: options.withWindow(ControlArgs(mode: mode)))
+        }
+    }
+
+    /// `agtermctl workspace filter [on|off|toggle] [--window W]` — turns the sidebar's workspace focus filter
+    /// on or off for a WHOLE window, leaving the marked set intact. Deliberately NO `--target`: it flips the
+    /// window's filter rather than one workspace, so its shape is `sidebar expand`/`collapse` (`ClientOptions`
+    /// only), not the `workspace.*` target commands. The three mode names are spelled out rather than derived:
+    /// `ControlToggleMode` carries no `validNames` (its tokens are per-command — `sidebar` spells the same
+    /// three `show|hide|toggle`), so this matches `session flag`/`sidebar mode`, not the enum-derived `Focus`.
+    struct Filter: RequestCommand {
+        static let configuration = CommandConfiguration(
+            abstract: "Turn the sidebar workspace focus filter on or off (on|off|toggle)."
+        )
+        @Argument(help: "Mode: on, off, or toggle (default).") var mode: String = "toggle"
         @OptionGroup var options: ClientOptions
 
         func validate() throws {
@@ -77,7 +122,7 @@ struct Workspace: ParsableCommand {
         }
 
         func makeRequest() throws -> ControlRequest {
-            ControlRequest(cmd: .workspaceFocus, target: target.target, args: options.withWindow(ControlArgs(mode: mode)))
+            ControlRequest(cmd: .workspaceFilter, args: options.withWindow(ControlArgs(mode: mode)))
         }
     }
 

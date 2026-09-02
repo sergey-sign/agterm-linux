@@ -3,7 +3,7 @@ import Testing
 @testable import agtermCore
 
 // SessionSnapshot / Snapshot serialization + restore round-trips, forward-compat legacy decodes, and
-// restore-time clamping. Split out of AppStoreTests to keep both files within the line budget.
+// restore-time clamping.
 @MainActor
 struct SnapshotRoundTripTests {
     @Test func splitCwdRoundTripsThroughSnapshot() {
@@ -17,7 +17,6 @@ struct SnapshotRoundTripTests {
         let snapped = snap.workspaces[0].sessions[0]
         #expect(snapped.cwd == "/a/primary")
         #expect(snapped.splitCwd == "/var/log")
-        // restore into a fresh store: each pane keeps its own seed.
         let restored = makeStore()
         restored.restore(from: snap)
         let r = restored.workspaces[0].sessions[0]
@@ -30,21 +29,28 @@ struct SnapshotRoundTripTests {
         let store = makeStore()
         let ws = store.addWorkspace(name: "work")
         let session = store.addSession(toWorkspace: ws.id, cwd: "/a")!
+        // split, because the capture path only ever records a split argv for a SHOWN split and the launch
+        // restore arms the split slot on the same condition
+        session.isSplit = true
         session.foregroundCommand = ["ssh", "gate", "-p", "22"]
         session.splitForegroundCommand = ["tail", "-f", "/var/log/x"]
         let snap = store.snapshot()
         let snapped = snap.workspaces[0].sessions[0]
         #expect(snapped.foregroundCommand == ["ssh", "gate", "-p", "22"])
         #expect(snapped.splitForegroundCommand == ["tail", "-f", "/var/log/x"])
+        // the executable half of the round trip is quit → next-launch bootstrap; a non-launch rebuild
+        // deliberately drops the captured commands (see AppStoreRestoreSeedTests).
         let restored = makeStore()
-        restored.restore(from: snap)
+        restored.restore(from: snap, launchRestore: true)
         let r = restored.workspaces[0].sessions[0]
-        #expect(r.foregroundCommand == ["ssh", "gate", "-p", "22"])
-        #expect(r.splitForegroundCommand == ["tail", "-f", "/var/log/x"])
+        #expect(r.pendingForegroundCommand == ["ssh", "gate", "-p", "22"])
+        #expect(r.pendingSplitForegroundCommand == ["tail", "-f", "/var/log/x"])
+        // re-snapshotting the restored store must not write the argv back — that is what makes the
+        // launch-time strip durable against any save before the surfaces consume it.
+        #expect(restored.snapshot().workspaces[0].sessions[0].foregroundCommand == nil)
     }
 
     @Test func legacySnapshotWithoutForegroundCommandDecodesNil() throws {
-        // a snapshot written before this field existed must still decode (nil = plain shell on restore).
         let json = #"{"id":"00000000-0000-0000-0000-000000000001","cwd":"/tmp"}"#
         let snap = try JSONDecoder().decode(SessionSnapshot.self, from: Data(json.utf8))
         #expect(snap.foregroundCommand == nil)
@@ -54,25 +60,22 @@ struct SnapshotRoundTripTests {
     }
 
     @Test func initialCommandRoundTripsThroughSnapshot() {
-        // a command session (e.g. `--command ssh …`) persists its creation command so it re-runs on
-        // restore instead of coming back a plain shell.
         let store = makeStore()
         let ws = store.addWorkspace(name: "work")
         let session = store.addSession(toWorkspace: ws.id, cwd: "/a")!
         session.initialCommand = "ssh user@host -t 'ssh inner'"
-        #expect(session.wasRestored == false) // a fresh session is not marked restored
+        #expect(session.wasRestored == false)
         let snap = store.snapshot()
         #expect(snap.workspaces[0].sessions[0].initialCommand == "ssh user@host -t 'ssh inner'")
         let restored = makeStore()
         restored.restore(from: snap)
         let r = restored.workspaces[0].sessions[0]
         #expect(r.initialCommand == "ssh user@host -t 'ssh inner'")
-        #expect(r.wasRestored == true) // restore marks the session, so the surface factory can gate its re-run
+        #expect(r.wasRestored == true) // the surface factory gates the re-run on this
     }
 
     @Test func commandWaitRoundTripsThroughSnapshot() {
-        // a held --command session persists the flag so a restored session that re-runs its command holds
-        // again, keeping the held/closed behavior consistent across restart (issue #254).
+        // a restored session that re-runs its command must hold again, like the original (issue #254).
         let store = makeStore()
         let ws = store.addWorkspace(name: "work")
         let session = store.addSession(toWorkspace: ws.id, cwd: "/a", command: "make test", wait: true)!
@@ -85,9 +88,8 @@ struct SnapshotRoundTripTests {
     }
 
     @Test func commandWaitFalseRoundTripsAsNilAndRestoresFalse() {
-        // a command session created WITHOUT --wait writes commandWait as nil (false is omitted), and restore
-        // maps that nil back to false via session(from:)'s `?? false` — not true. Exercises both the write
-        // gate and the nil->false restore mapping (a `?? true` mutant would restore true and fail here).
+        // false is omitted on write, so restore maps the resulting nil back through `?? false`; a `?? true`
+        // mutant would restore true and fail here.
         let store = makeStore()
         let ws = store.addWorkspace(name: "work")
         let session = store.addSession(toWorkspace: ws.id, cwd: "/a", command: "make test")!
@@ -100,8 +102,7 @@ struct SnapshotRoundTripTests {
     }
 
     @Test func legacySnapshotWithoutCommandWaitDecodesNil() throws {
-        // a snapshot written before --wait existed has no commandWait key; it must decode as nil (not fail
-        // the whole load), like every other post-v1 optional field; restore maps nil to false.
+        // the missing key must decode as nil rather than failing the whole load, like every post-v1 field.
         let json = #"{"id":"\#(UUID().uuidString)","customName":null,"cwd":"/a","initialCommand":"make test"}"#
         let snap = try JSONDecoder().decode(SessionSnapshot.self, from: Data(json.utf8))
         #expect(snap.commandWait == nil)
@@ -122,7 +123,6 @@ struct SnapshotRoundTripTests {
     }
 
     @Test func sidebarDefaultsWhenSnapshotOmitsThem() {
-        // a snapshot written before these fields existed decodes them as nil; restore falls back to defaults.
         let store = makeStore()
         store.sidebarWidth = 400
         store.sidebarVisible = false
@@ -132,7 +132,6 @@ struct SnapshotRoundTripTests {
     }
 
     @Test func restoreClampsOutOfRangeSidebarWidth() {
-        // a corrupt or hand-edited snapshot must not drive an out-of-range frame width; restore clamps it.
         let store = makeStore()
         store.restore(from: Snapshot(workspaces: [], sidebarWidth: 2000))
         #expect(store.sidebarWidth == AppStore.sidebarWidthMax)
@@ -141,7 +140,7 @@ struct SnapshotRoundTripTests {
     }
 
     @Test func restoreClampsOutOfRangeSplitRatio() {
-        // a corrupt snapshot ratio must not feed an out-of-range fraction into NSSplitView.setPosition.
+        // an out-of-range fraction would reach NSSplitView.setPosition unclamped.
         let store = makeStore()
         let ws = store.addWorkspace(name: "work")
         let session = store.addSession(toWorkspace: ws.id, cwd: "/a")!
@@ -164,6 +163,44 @@ struct SnapshotRoundTripTests {
         #expect(restored.workspaces[0].sessions[0].splitRatio == 0.63)
     }
 
+    @Test func splitAxisRoundTripsAndLegacyOrUnknownValuesDefaultLeftRight() throws {
+        let store = makeStore()
+        let ws = store.addWorkspace(name: "work")
+        let session = store.addSession(toWorkspace: ws.id, cwd: "/a")!
+        session.isSplit = true
+        session.hasSplit = true
+        session.splitAxis = .topBottom
+
+        let snapshot = store.snapshot()
+        #expect(snapshot.workspaces[0].sessions[0].splitAxis == .topBottom)
+        let restored = makeStore()
+        restored.restore(from: snapshot)
+        #expect(restored.workspaces[0].sessions[0].splitAxis == .topBottom)
+
+        let legacy = #"{"id":"00000000-0000-0000-0000-000000000001","cwd":"/tmp","isSplit":true}"#
+        let legacySession = try JSONDecoder().decode(SessionSnapshot.self, from: Data(legacy.utf8))
+        #expect(legacySession.splitAxis == nil)
+        let legacyStore = makeStore()
+        legacyStore.restore(from: Snapshot(workspaces: [
+            WorkspaceSnapshot(id: UUID(), name: "legacy", sessions: [legacySession]),
+        ]))
+        #expect(legacyStore.workspaces[0].sessions[0].splitAxis == .leftRight)
+
+        let unknown = #"{"id":"00000000-0000-0000-0000-000000000002","cwd":"/tmp","isSplit":true,"splitAxis":"diagonal"}"#
+        let unknownSession = try JSONDecoder().decode(SessionSnapshot.self, from: Data(unknown.utf8))
+        #expect(unknownSession.splitAxis == nil)
+    }
+
+    @Test func hiddenSplitDoesNotPersistAnUnrestorableAxis() {
+        let store = makeStore()
+        let ws = store.addWorkspace(name: "work")
+        let session = store.addSession(toWorkspace: ws.id, cwd: "/a")!
+        session.hasSplit = true
+        session.isSplit = false
+        session.splitAxis = .topBottom
+        #expect(store.snapshot().workspaces[0].sessions[0].splitAxis == nil)
+    }
+
     @Test func restoreCommandRoundTripsThroughSnapshot() {
         let store = makeStore()
         let ws = store.addWorkspace(name: "work")
@@ -183,8 +220,8 @@ struct SnapshotRoundTripTests {
     }
 
     @Test func emptyRestoreCommandRoundTripsAsEmptyNotNil() throws {
-        // "" is the "pinned to nothing" state of the tri-state and must survive JSON as an empty string —
-        // collapsing it to nil would silently turn the opt-out back into auto-capture.
+        // "" is the tri-state's "pinned to nothing"; collapsing it to nil turns the opt-out back into
+        // auto-capture.
         let store = makeStore()
         let ws = store.addWorkspace(name: "work")
         let session = store.addSession(toWorkspace: ws.id, cwd: "/a")!
@@ -202,8 +239,7 @@ struct SnapshotRoundTripTests {
     }
 
     @Test func legacySnapshotWithoutRestoreCommandDecodesNil() throws {
-        // a snapshot written before the override existed must still decode (nil = no override, the
-        // auto-capture behavior) rather than throwing and wiping the saved tree.
+        // a throw here would fail the whole load and wipe the saved tree.
         let json = #"{"id":"\#(UUID().uuidString)","cwd":"/tmp","foregroundCommand":["claude"]}"#
         let snap = try JSONDecoder().decode(SessionSnapshot.self, from: Data(json.utf8))
         #expect(snap.restoreCommand == nil)
@@ -211,9 +247,120 @@ struct SnapshotRoundTripTests {
         #expect(snap.foregroundCommand == ["claude"])
     }
 
+    @Test func focusSetRoundTripsThroughSnapshot() throws {
+        let store = makeStore()
+        let one = store.addWorkspace(name: "one")
+        _ = store.addWorkspace(name: "two")
+        let three = store.addWorkspace(name: "three")
+        store.setFocusMembership(three.id, member: true) // marked out of tree order
+        store.setFocusMembership(one.id, member: true)
+        store.setFocusEnabled(true) // marking only marks; applying the set is its own step
+        let snap = store.snapshot()
+        #expect(snap.focusedWorkspaceIDs == [one.id, three.id]) // tree order, never the Set's hash order
+        #expect(snap.focusEnabled == true)
+        let decoded = try JSONDecoder().decode(Snapshot.self, from: JSONEncoder().encode(snap))
+        let restored = makeStore()
+        restored.restore(from: decoded)
+        #expect(restored.focusedWorkspaceIDs == [one.id, three.id] && restored.focusEnabled)
+        #expect(restored.visibleWorkspaces.map(\.id) == [one.id, three.id])
+    }
+
+    @Test func disabledFilterRoundTripsKeepingItsMarkedSet() {
+        let store = makeStore()
+        let work = store.addWorkspace(name: "work")
+        _ = store.addWorkspace(name: "personal")
+        store.setFocusMembership(work.id, member: true)
+        store.setFocusEnabled(true)
+        store.setFocusEnabled(false)
+        let snap = store.snapshot()
+        #expect(snap.focusedWorkspaceIDs == [work.id] && snap.focusEnabled == nil) // off omits the key
+        let restored = makeStore()
+        restored.restore(from: snap)
+        #expect(restored.focusedWorkspaceIDs == [work.id] && !restored.focusEnabled)
+    }
+
+    @Test func unmarkedStoreOmitsBothFocusKeys() throws {
+        // an unfiltered tree must serialize byte-identically to a legacy snapshot.
+        let store = makeStore()
+        _ = store.addWorkspace(name: "work")
+        let snap = store.snapshot()
+        #expect(snap.focusedWorkspaceIDs == nil && snap.focusEnabled == nil)
+        let json = try String(decoding: JSONEncoder().encode(snap), as: UTF8.self)
+        // the prefix match also covers the legacy `focusedWorkspaceID` key.
+        #expect(!json.contains("focusedWorkspace") && !json.contains("focusEnabled"))
+    }
+
+    @Test func legacySnapshotWithSingleFocusedWorkspaceDecodesAsAnEnabledSet() throws {
+        // in the pre-set format the key's mere presence meant the filter was on.
+        let ws = UUID()
+        let json = #"{"version":1,"workspaces":[],"focusedWorkspaceID":"\#(ws.uuidString)"}"#
+        let snap = try JSONDecoder().decode(Snapshot.self, from: Data(json.utf8))
+        #expect(snap.focusedWorkspaceIDs == [ws])
+        #expect(snap.focusEnabled == true)
+    }
+
+    @Test func reEncodingAMigratedSnapshotDropsTheLegacyFocusKey() throws {
+        // a legacy file riding a load -> mutate -> save path (e.g. `WindowLibrary.clearClosedWindowFontSizes`)
+        // must be rewritten with the SET keys alone.
+        let ws = UUID()
+        let json = #"{"version":1,"workspaces":[],"focusedWorkspaceID":"\#(ws.uuidString)"}"#
+        let decoded = try JSONDecoder().decode(Snapshot.self, from: Data(json.utf8))
+
+        let reEncoded = try String(decoding: JSONEncoder().encode(decoded), as: UTF8.self)
+
+        #expect(!reEncoded.contains("\"focusedWorkspaceID\""))
+        #expect(reEncoded.contains("\"focusedWorkspaceIDs\"") && reEncoded.contains("\"focusEnabled\""))
+        let again = try JSONDecoder().decode(Snapshot.self, from: Data(reEncoded.utf8))
+        #expect(again.focusedWorkspaceIDs == [ws] && again.focusEnabled == true)
+    }
+
+    @Test func snapshotWithBothFocusKeysPrefersTheSet() throws {
+        // both keys means a downgrade-then-upgrade round trip; the legacy key holds at most one member,
+        // so taking it would silently narrow a multi-workspace filter.
+        let a = UUID(), b = UUID(), stale = UUID()
+        let json = #"""
+        {"version":1,"workspaces":[],"focusedWorkspaceID":"\#(stale.uuidString)",
+         "focusedWorkspaceIDs":["\#(a.uuidString)","\#(b.uuidString)"],"focusEnabled":false}
+        """#
+        let snap = try JSONDecoder().decode(Snapshot.self, from: Data(json.utf8))
+        #expect(snap.focusedWorkspaceIDs == [a, b])
+        #expect(snap.focusEnabled == false) // the explicit flag wins, not the legacy key's implied `true`
+    }
+
+    @Test func snapshotWithoutAnyFocusKeyDecodesToNilWithoutThrowing() throws {
+        // a throw here would wipe the saved tree over a per-window view filter.
+        let json = #"{"version":1,"workspaces":[]}"#
+        let snap = try JSONDecoder().decode(Snapshot.self, from: Data(json.utf8))
+        #expect(snap.focusedWorkspaceIDs == nil && snap.focusEnabled == nil)
+        let store = makeStore()
+        store.restore(from: snap)
+        #expect(store.focusedWorkspaceIDs.isEmpty && !store.focusEnabled)
+    }
+
+    @Test func hudStateNeverReachesTheSnapshot() throws {
+        let store = makeStore()
+        let ws = store.addWorkspace(name: "work")
+        let session = store.addSession(toWorkspace: ws.id, cwd: "/a")!
+        session.overlayActive = true
+        session.overlaySizePercent = 30
+        session.hudSpec = HudSpec(message: "gathering options", detail: "scanning /a", spinner: .bar)
+        session.hudFile = "/tmp/agterm-hud-test.txt"
+
+        let snap = store.snapshot()
+        let json = String(decoding: try JSONEncoder().encode(snap), as: UTF8.self)
+        #expect(!json.contains("hud"))
+        #expect(!json.contains("gathering options"))
+
+        let restored = makeStore()
+        restored.restore(from: snap)
+        let r = restored.workspaces[0].sessions[0]
+        #expect(r.hudSpec == nil)
+        #expect(r.hudFile == nil)
+        #expect(r.hudActive == false)
+        #expect(r.overlayActive == false)
+    }
+
     @Test func sessionSnapshotDecodesWithoutSplitRatio() throws {
-        // a SessionSnapshot persisted before splitRatio existed (the key absent) must decode to nil, not
-        // fail the load — the forward-compat contract the optional field documents.
         let json = "{\"id\":\"\(UUID().uuidString)\",\"cwd\":\"/a\"}"
         let snap = try JSONDecoder().decode(SessionSnapshot.self, from: Data(json.utf8))
         #expect(snap.splitRatio == nil)

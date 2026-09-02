@@ -16,7 +16,13 @@ extension AppController {
                 NotificationManager.withdraw(windowID: windowID, sessionID: id)
                 rebuildSidebar()
             }
-            showActive()
+            // Reactivation can preempt a popover dismissal's own refocus, so it must be no coarser — and
+            // must decline while a live search entry holds the keyboard.
+            if searchEntryHoldsKeyboard() {
+                showActive(focus: false)
+            } else {
+                showActiveFocusingVisibleSurface()
+            }
             searchTargetSurface(for: id)?.refresh()
         }
     }
@@ -52,8 +58,38 @@ extension AppController {
     func windowWillClose() {
         customCommandOrigin.invalidate()
         commitBackgroundOpacity()
-        dismissSessionPicker()
+        // `refocus: false` throughout: the widget tree is about to be destroyed, and the control pick's
+        // deferred grab would fire after that against a finalized window.
+        dismissSessionPicker(refocus: false)
+        dismissControlPick(retainResultThroughRegistry: true, refocus: false)
+        // Not optional cleanup: a popover left parented at destroy hangs the close, and GTK emits no
+        // `"closed"` then, so this call is the only notice.
+        dismissContextMenu(refocus: false)
+        // EVERY dialog this window owns is dismissed here, or it outlives the widget tree and keeps the
+        // controller alive with it — a bare toplevel (the theme picker, the palette) is not destroyed with
+        // its transient parent under GTK4, and a hosted AdwDialog holds the same `passRetained` on "closed".
+        // The theme picker's dismissal is a CANCELLATION (`cancelTheme` reverts the live preview and clears
+        // the process-global override), never a bare close; it is inert with no picker up. Full rationale:
+        // `.claude/rules/main-loop.md`.
+        cancelTheme()
+        closePalette()
+        dismissSettings()
+        dismissAuxiliaryDialogs()
         sidebarMetadataDebouncer.cancel()
+        // These deferred jobs now really fire on Linux, and each outlives this window if something else
+        // still holds the controller (an open Settings dialog, palette or theme picker retains it): a
+        // pending layout save would `store.save()` after `removeWindow` deleted `windows/<id>.json` and
+        // resurrect it as an orphan, a pending preview would set the theme override with no picker left to
+        // clear it, and the trailing soft-close reconcile would rebuild an already-destroyed widget tree.
+        layoutSaveDebouncer.cancel()
+        themePreviewDebouncer.cancel()
+        softCloseReconcile.cancel()
+        // The post-rebuild selection re-publish would touch destroyed rows.
+        selectionRepublish.cancel()
+        // The soft-close grace finalizer is STORE-scoped, so none of the window-scoped cancels above reach
+        // it. FINALIZE rather than cancel — cancelling strands the held records and leaks what only the
+        // finalizer's teardown sweeps (see `.claude/rules/main-loop.md`).
+        store.finalizeAllPendingCloses()
         cancelPendingWorkspaceToggle()
         cancelLeaderDeadlineForWindowClose()
         splitRatioRestore.cancelAll()
@@ -62,11 +98,13 @@ extension AppController {
         TerminalZoomRegistry.shared.unregister(windowID)
         closeDashboard(refocus: false)
         DashboardControllerRegistry.shared.unregister(windowID)
+        PickRegistry.shared.unregister(windowID)
         autoFollowCoordinator.stop()
         let w = gtk_widget_get_width(W(window)), h = gtk_widget_get_height(W(window))
         if w > 0, h > 0 { library.setGeometry(WindowGeometry.Size(width: Double(w), height: Double(h)), forWindow: windowID) }
         if linuxSettingsStore().load().restoreRunningCommand ?? false { captureForegroundCommands() }
         store.save()
+        store.discardHudBodies()
         quickSurface?.teardown()
         quickSurface = nil
         quickFrame = nil
@@ -74,6 +112,8 @@ extension AppController {
         for s in splitSurfaces.values { s.teardown() }
         for s in scratchSurfaces.values { s.teardown() }
         for s in overlaySurfaces.values { s.teardown() }
+        for s in leftOverlaySurfaces.values { s.teardown() }
+        for s in rightOverlaySurfaces.values { s.teardown() }
         library.closeWindow(windowID)
         gWindows[windowID] = nil
         if gController === self { gController = gWindows.values.first }

@@ -10,7 +10,8 @@ public struct IntegrationService: Sendable {
 
     public func status() -> IntegrationSnapshot {
         IntegrationSnapshot(items: [
-            cliStatus(), claudeHooksStatus(), codexHooksStatus(), piHooksStatus(), skillStatus(),
+            cliStatus(), claudeHooksStatus(), codexHooksStatus(), piHooksStatus(),
+            opencodePluginStatus(), skillStatus(),
         ])
     }
 

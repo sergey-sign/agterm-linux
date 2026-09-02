@@ -160,6 +160,65 @@ extension IntegrationService {
         )
     }
 
+    func opencodePluginStatus() -> IntegrationItemStatus {
+        let home = environment.homeDirectory.path
+        let base = environment.homeDirectory.appendingPathComponent(".config/opencode", isDirectory: true)
+        let path = URL(fileURLWithPath: AgentHooksInstall.opencodePluginPath(home: home))
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: base.path, isDirectory: &isDirectory),
+              isDirectory.boolValue else {
+            return IntegrationItemStatus(
+                kind: .opencodePlugin, state: .unavailable, path: path.path,
+                detail: "No ~/.config/opencode directory was detected."
+            )
+        }
+        guard let package = environment.resource(named: "agent-status") else {
+            return IntegrationItemStatus(
+                kind: .opencodePlugin, state: .unavailable, path: path.path,
+                detail: "The bundled OpenCode plugin is unavailable."
+            )
+        }
+        let source = package.appendingPathComponent(AgentHooksInstall.opencodePluginRelativePath)
+        guard let bundled = try? String(contentsOf: source, encoding: .utf8),
+              bundled.contains(AgentHooksInstall.opencodePluginMarker) else {
+            return IntegrationItemStatus(
+                kind: .opencodePlugin, state: .unavailable, path: path.path,
+                detail: "The bundled OpenCode plugin is invalid."
+            )
+        }
+        let exists = IntegrationFilesystem.fingerprint(path).value != "missing"
+        guard exists else {
+            return IntegrationItemStatus(
+                kind: .opencodePlugin, state: .notInstalled, path: path.path,
+                detail: "OpenCode's agterm lifecycle plugin is not installed."
+            )
+        }
+        let existing: String
+        do {
+            existing = try IntegrationFilesystem.read(path) ?? ""
+        } catch {
+            return IntegrationItemStatus(
+                kind: .opencodePlugin, state: .conflict, path: path.path,
+                detail: "The OpenCode plugin could not be read."
+            )
+        }
+        guard AgentHooksInstall.mayOverwriteOpenCodePlugin(
+            fileExists: true, existingContents: existing
+        ) else {
+            return IntegrationItemStatus(
+                kind: .opencodePlugin, state: .conflict, path: path.path,
+                detail: "A user-owned OpenCode plugin already uses this path."
+            )
+        }
+        let state: IntegrationState = bundled == existing ? .installed : .updateAvailable
+        return IntegrationItemStatus(
+            kind: .opencodePlugin, state: state, path: path.path,
+            detail: state == .installed
+                ? "OpenCode's agterm lifecycle plugin is installed and current."
+                : "OpenCode's managed agterm lifecycle plugin can be updated."
+        )
+    }
+
     func skillStatus() -> IntegrationItemStatus {
         let fm = FileManager.default
         guard let source = environment.resource(named: "agent-skill") else {

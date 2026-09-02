@@ -1,9 +1,8 @@
 import XCTest
 
 /// End-to-end tests for the user-editable keymap (`<stateDir>/config/keymap.conf`). Seeded via the
-/// isolated `AGTERM_STATE_DIR` before launch so `SettingsModel` parses it at init. The palette case
-/// asserts a custom command shows the `custom` badge in the action palette and runs from it, using
-/// the branch's observable-side-effect pattern (the command `touch`es a tempfile that the test polls).
+/// isolated `AGTERM_STATE_DIR` before launch so `SettingsModel` parses it at init. A custom command's
+/// effect is observed as a side effect: it `touch`es a tempfile the test polls for.
 @MainActor
 final class KeymapUITests: XCTestCase {
     private var app: XCUIApplication!
@@ -28,7 +27,6 @@ final class KeymapUITests: XCTestCase {
     }
 
     func testCustomCommandShowsBadgeInPaletteAndRuns() throws {
-        // a palette-only custom command (no chord) that touches a marker file when run.
         let marker = markerDir.appendingPathComponent("touched")
         seedKeymap("command \"Touch File\" touch '\(marker.path)'\n")
         app.launchForUITest()
@@ -37,19 +35,22 @@ final class KeymapUITests: XCTestCase {
         openPalette("Command Palette")
         typeIntoPalette("Touch File")
 
-        // the custom badge identifies the row as a keymap command; assert it surfaced.
-        let badge = app.descendants(matching: .any).matching(identifier: "palette-badge").firstMatch
-        XCTAssertTrue(badge.waitForExistence(timeout: 5), "the custom command should show the `custom` badge in the palette")
+        // #316 put `palette-item-<id>` on the row container and SwiftUI propagates a container identifier
+        // onto its descendant Texts, so the badge stopped answering to `palette-badge`; its accessibility
+        // VALUE still carries the label, which is what identifies it now.
+        let rows = app.descendants(matching: .staticText)
+            .matching(NSPredicate(format: "identifier BEGINSWITH 'palette-item-'"))
+        XCTAssertTrue(rows.firstMatch.waitForExistence(timeout: 5), "the filtered palette should show the custom command")
+        XCTAssertTrue(poll { rows.allElementsBoundByIndex.contains { ($0.value as? String) == "custom" } },
+                      "the custom command should show the `custom` badge in the palette")
 
-        // run the selected (top) match and assert the command actually executed.
         app.typeKey(.return, modifierFlags: [])
         XCTAssertTrue(poll { FileManager.default.fileExists(atPath: marker.path) },
                       "running the custom command from the palette should touch the marker file")
     }
 
-    // the Custom Commands palette (Navigate ▸ Custom Commands, ⌃⇧O) lists ONLY custom commands and drops
-    // the `custom` badge — every row is already custom. Seed one custom command, open the palette, and
-    // assert: the custom row appears, a built-in action (New Session) does NOT, no badge shows, and it runs.
+    // the Custom Commands palette (Navigate ▸ Custom Commands, ⌃⇧O) drops the `custom` badge — every row
+    // in it is already custom.
     func testCustomCommandsPaletteShowsCustomOnlyWithoutBadge() throws {
         let marker = markerDir.appendingPathComponent("custom-only")
         seedKeymap("command \"Touch File\" touch '\(marker.path)'\n")
@@ -59,22 +60,22 @@ final class KeymapUITests: XCTestCase {
         openPalette("Custom Commands")
         XCTAssertTrue(app.staticTexts["Touch File"].waitForExistence(timeout: 5),
                       "the custom command should appear in the Custom Commands palette")
-        // built-in actions are excluded — this palette is custom-only.
         XCTAssertFalse(app.staticTexts["New Session"].exists, "built-in actions must not appear in the Custom Commands palette")
-        // the `custom` badge is suppressed here (the whole list is custom).
-        XCTAssertFalse(app.descendants(matching: .any).matching(identifier: "palette-badge").firstMatch.exists,
+        // through the row identifier for the same reason as the positive lookup above: querying
+        // `palette-badge` here would find nothing whether or not a badge renders, so it could not fail.
+        let customRows = app.descendants(matching: .staticText)
+            .matching(NSPredicate(format: "identifier BEGINSWITH 'palette-item-'"))
+        XCTAssertFalse(customRows.allElementsBoundByIndex.contains { ($0.value as? String) == "custom" },
                        "the Custom Commands palette should not show the `custom` badge")
 
-        // filter to the command (also focuses the field), then run it and assert it executed.
         typeIntoPalette("Touch File")
         app.typeKey(.return, modifierFlags: [])
         XCTAssertTrue(poll { FileManager.default.fileExists(atPath: marker.path) },
                       "running a custom command from the Custom Commands palette should touch the marker file")
     }
 
-    // the Increase Font Size palette hint must NOT show the unparseable kitty string `cmd++` (its
-    // default chord's key is `+`, a grammar separator, so `displayString` renders `cmd++`). The
-    // palette-hint path falls back to a readable ⌘+ glyph for separator-key chords instead.
+    // the default chord's key is `+`, a grammar separator, so `displayString` renders the unparseable
+    // `cmd++`; the palette hint falls back to a readable ⌘+ glyph for separator-key chords.
     func testIncreaseFontSizePaletteHintIsNotBroken() throws {
         app.launchForUITest()
         XCTAssertTrue(app.staticTexts["session-row"].firstMatch.waitForExistence(timeout: 20), "seeded session should exist")
@@ -82,41 +83,32 @@ final class KeymapUITests: XCTestCase {
         openPalette("Command Palette")
         typeIntoPalette("Increase Font Size")
 
-        // the row appears (its title is the static text the palette renders)…
         XCTAssertTrue(app.staticTexts["Increase Font Size"].waitForExistence(timeout: 5),
                       "the Increase Font Size palette item should appear")
-        // …and the broken `cmd++` hint must NOT be present anywhere in the palette.
         XCTAssertFalse(app.staticTexts["cmd++"].exists, "the palette hint must not render the unparseable `cmd++`")
     }
 
-    // a `map` override moves a built-in's key: bind new_session to ⌘⇧Y. new_session is the most
-    // reliably observable built-in — each new session is a countable `session-row` element. Pressing
-    // the OVERRIDE chord adds a row; pressing the OLD default (⌘N) does NOT, proving the key moved.
-    // (Built-ins fire via the menu key-equivalent, so no terminal focus is needed.)
+    // new_session is the most reliably observable built-in — each new session is a countable `session-row`
+    // element. Built-ins fire via the menu key-equivalent, so no terminal focus is needed.
     func testBuiltinOverrideMovesKey() throws {
         seedKeymap("map cmd+shift+y new_session\n")
         app.launchForUITest()
         XCTAssertTrue(app.staticTexts["session-row"].firstMatch.waitForExistence(timeout: 20), "seeded session should exist")
         XCTAssertTrue(poll { self.sessionRowCount() == 1 }, "should start with the one seeded session")
 
-        // the override chord ⌘⇧Y now triggers new_session → a second row appears.
         app.typeKey("y", modifierFlags: [.command, .shift])
         XCTAssertTrue(poll { self.sessionRowCount() == 2 }, "the override chord ⌘⇧Y should create a new session")
 
-        // the OLD default ⌘N must no longer trigger new_session (the key moved) → the count stays at 2.
         app.typeKey("n", modifierFlags: .command)
         XCTAssertFalse(poll { self.sessionRowCount() == 3 }, "the old default ⌘N must no longer create a session")
         XCTAssertEqual(sessionRowCount(), 2, "no extra session should have been created by the moved-away default")
 
-        // positive control: the OVERRIDE chord ⌘⇧Y is still bound, so it MUST still create a session.
-        // this makes the negative above meaningful — it distinguishes "⌘N is correctly inert" from
-        // "key dispatch is dead/slow" (which would also make this still-bound chord fail).
+        // positive control: ⌘⇧Y is still bound, which distinguishes "⌘N is correctly inert" from "key
+        // dispatch is dead/slow" — the latter would fail here too.
         app.typeKey("y", modifierFlags: [.command, .shift])
         XCTAssertTrue(poll { self.sessionRowCount() == 3 }, "the still-bound override ⌘⇧Y should keep creating sessions")
     }
 
-    // a custom command bound to a single chord fires from a focused terminal: bind ⌘⇧E to `touch
-    // <file>`, focus the terminal, press the chord, assert the file appears (observable-side-effect).
     func testCustomCommandSingleChordFires() throws {
         let marker = markerDir.appendingPathComponent("single")
         seedKeymap("command \"Touch A\" cmd+shift+e touch '\(marker.path)'\n")
@@ -127,15 +119,11 @@ final class KeymapUITests: XCTestCase {
                       "the custom single chord ⌘⇧E should run its command and touch the marker file")
     }
 
-    // a custom command still fires when the window has NO sessions — the SSH-disconnect / "all my
-    // terminals closed" state, where every session's shell exited and no terminal surface holds first
-    // responder. bind ⌘⇧E to `touch <file>`, exit the only session so the window's tree is empty, then
-    // press the chord and assert it fires. regression guard for the empty-window first-responder gate in
-    // `CustomCommandRunner.handleKeyDown` (the runner used to fire ONLY with a focused terminal surface).
+    // the SSH-disconnect state: every session's shell exited, so no terminal surface holds first responder
+    // and the empty-window arm of `CustomCommandRunner.handleKeyDown` is the only path left.
     func testCustomCommandFiresWhenWindowHasNoSessions() throws {
-        // bind a command that expands {AGT_WINDOW_ID} into the touched filename: a file named
-        // `win-<uuid>` proves BOTH that the chord fired from the empty window AND that sessionlessContext()
-        // populated the window id — a degenerate empty context would create a bare `win-`.
+        // the touched filename embeds {AGT_WINDOW_ID}: a `win-<uuid>` proves sessionlessContext() populated
+        // the window id, a bare `win-` would mean a degenerate empty context.
         seedKeymap("command \"Touch E\" cmd+shift+e touch '\(markerDir.path)/win-{AGT_WINDOW_ID}'\n")
         app.launchForUITest()
         XCTAssertTrue(app.staticTexts["session-row"].firstMatch.waitForExistence(timeout: 20), "seeded session should exist")
@@ -148,11 +136,8 @@ final class KeymapUITests: XCTestCase {
                              "sessionlessContext() should populate {AGT_WINDOW_ID}; got bare \"\(created ?? "nil")\"")
     }
 
-    // a bound chord must NOT fire while a text field has focus — the runner's `responder is NSText` guard
-    // (Settings editor, inline rename, palette search). Without it, the terminal-window firing path would
-    // eat a keystroke meant for the field. Seed ⌘⇧E, open the action palette (its search field is a text
-    // field hosted IN the agterm window, so this also proves the NSText check wins over the
-    // WindowRegistry.contains terminal-window path), press the chord, assert the marker never appears.
+    // the palette's search field is a text field hosted IN the agterm terminal window, so this proves the
+    // runner's `responder is NSText` guard wins over its `WindowRegistry.contains` fire-anyway path.
     func testCustomCommandDoesNotFireWhileTextFieldFocused() throws {
         let marker = markerDir.appendingPathComponent("textfield-guard")
         seedKeymap("command \"Touch F\" cmd+shift+e touch '\(marker.path)'\n")
@@ -167,18 +152,15 @@ final class KeymapUITests: XCTestCase {
         XCTAssertFalse(poll({ FileManager.default.fileExists(atPath: marker.path) }, timeout: 3),
                        "a bound chord must not fire while a text field has focus")
 
-        // positive control (same launch): close the palette so the field yields focus, then the SAME
-        // chord must fire — proving the binding was live and the negative assertion above wasn't vacuous.
+        // positive control: the same chord must fire once the field yields focus, so the negative above
+        // cannot pass on a dead binding.
         app.typeKey(.escape, modifierFlags: [])
         XCTAssertTrue(chordFiresMarker(marker) { app.typeKey("e", modifierFlags: [.command, .shift]) },
                       "after the palette closes, the same chord should fire (binding was live)")
     }
 
-    // a custom command bound to a SHIFTED-SYMBOL key fires: bind `shift+/` (the `?` key) to `touch
-    // <file>`, focus the terminal, press Shift+/ (which types `?`), assert the file appears. Regression
-    // guard for the base-key derivation in `CustomCommandRunner.chord(from:)`: the runner must normalize
-    // a shifted symbol to its BASE key (shift+/ → key "/", matching the `shift+/` binding), not to the
-    // shifted glyph "?" — a parser↔runtime mismatch the host-free tests structurally can't reach.
+    // `CustomCommandRunner.chord(from:)` must normalize a shifted symbol to its BASE key (shift+/ → key
+    // "/") rather than the shifted glyph "?" — a parser↔runtime mismatch the host-free tests can't reach.
     func testCustomCommandShiftedSymbolFires() throws {
         let marker = markerDir.appendingPathComponent("shifted")
         seedKeymap("command \"Touch Q\" shift+/ touch '\(marker.path)'\n")
@@ -189,28 +171,34 @@ final class KeymapUITests: XCTestCase {
                       "a custom command bound to shift+/ should fire when Shift+/ (the ? key) is pressed")
     }
 
-    // a custom command bound to a LEADER sequence fires: bind `ctrl+a>g` to `touch <file>`, focus the
-    // terminal, press ctrl+a then g (two key events), assert the file appears. ctrl+a normally moves to
-    // the line start in the shell, but the runner arms on it and consumes the sequence.
+    // the parser accepting `cmd+shift+left` means nothing unless the runner's NSEvent→Chord mapping yields
+    // key "left" for keyCode 123: without that entry the event falls to the character branch and produces
+    // the private-use arrow glyph — a valid Chord no keymap line can spell, so the binding never fires.
+    func testCustomCommandArrowChordFires() throws {
+        let marker = markerDir.appendingPathComponent("arrow")
+        seedKeymap("command \"Touch Arrow\" cmd+shift+left touch '\(marker.path)'\n")
+        app.launchForUITest()
+        focusTerminal()
+
+        XCTAssertTrue(chordFiresMarker(marker) { app.typeKey(.leftArrow, modifierFlags: [.command, .shift]) },
+                      "a custom command bound to cmd+shift+left should fire when ⌘⇧← is pressed (issue #278)")
+    }
+
+    // ctrl+a normally moves to the shell's line start; the runner arms on it and consumes the sequence.
     func testCustomCommandLeaderFires() throws {
         let marker = markerDir.appendingPathComponent("leader")
         seedKeymap("command \"Touch B\" ctrl+a>g touch '\(marker.path)'\n")
         app.launchForUITest()
         focusTerminal()
 
-        // chordFiresMarker may press the ctrl+a>g burst several times before the marker appears. This is
-        // safe only because the matcher re-arms on each fresh leader (ctrl+a): a dropped first burst
-        // leaves the matcher in a clean state, so the next ctrl+a starts the sequence over rather than
-        // the retry colliding with a half-consumed leader.
+        // chordFiresMarker's retried burst is safe only because the matcher re-arms on each fresh ctrl+a:
+        // a dropped burst leaves a clean state instead of a half-consumed leader for the retry to collide with.
         XCTAssertTrue(chordFiresMarker(marker) {
             app.typeKey("a", modifierFlags: .control)
             app.typeKey("g", modifierFlags: [])
         }, "the custom leader ctrl+a>g should run its command and touch the marker file")
     }
 
-    // "Reload Keymap" re-reads keymap.conf: launch with ⌘⇧J bound to touch fileC1, then rewrite the
-    // file so ⌘⇧J touches fileC2 instead, invoke Reload Keymap (File menu), and assert the POST-reload
-    // chord touches fileC2 — proving the reload picked up the rewritten file.
     func testReloadKeymapPicksUpRewrittenFile() throws {
         let before = markerDir.appendingPathComponent("reload-before")
         let after = markerDir.appendingPathComponent("reload-after")
@@ -218,42 +206,30 @@ final class KeymapUITests: XCTestCase {
         app.launchForUITest()
         focusTerminal()
 
-        // the pre-reload binding fires (sanity: the seeded file is in effect).
         XCTAssertTrue(chordFiresMarker(before) { app.typeKey("j", modifierFlags: [.command, .shift]) },
                       "the pre-reload binding ⌘⇧J should touch the first marker")
 
-        // rewrite keymap.conf so the same chord now touches a DIFFERENT file.
         seedKeymap("command \"Touch C\" cmd+shift+j touch '\(after.path)'\n")
 
-        // invoke Reload Keymap from the File menu.
         app.menuBars.menuBarItems["File"].click()
         let reload = app.menuItems["Reload Keymap"]
         XCTAssertTrue(reload.waitForExistence(timeout: 5), "File menu should offer Reload Keymap")
         reload.click()
 
-        // after the reload the chord must touch the NEW file (the rewritten binding is in effect).
         focusTerminal()
         XCTAssertTrue(chordFiresMarker(after) { app.typeKey("j", modifierFlags: [.command, .shift]) },
                       "after Reload Keymap the rewritten binding should touch the second marker")
     }
 
-    // the Key Mapping settings tab renders the parse diagnostics and its Reload button re-reads the
-    // file: seed a broken line, open Settings ▸ Key Mapping, assert the diagnostic surfaces; then
-    // rewrite the file clean, click the tab's Reload, assert the diagnostics clear to "No issues.".
     func testKeyMappingSettingsTabShowsDiagnosticsAndReloads() throws {
         seedKeymap("bogus line here\n")
         app.launchForUITest()
         XCTAssertTrue(app.staticTexts["session-row"].firstMatch.waitForExistence(timeout: 20), "seeded session should exist")
 
-        // open the tab (retrying the click) and confirm the diagnostics list renders the broken line.
-        // a SwiftUI container with an accessibilityIdentifier combines its child Texts into the
-        // container's own label, so match the broken-line message anywhere in the diagnostics subtree
-        // OR in the app's static texts.
         settingsControl(tab: "Key Mapping", control: "settings-keymap-diagnostics")
         XCTAssertTrue(poll { self.diagnosticsContain("unknown verb") },
                       "the diagnostics list should render the broken line")
 
-        // rewrite the file clean, then Reload from the tab; the diagnostics must clear to "No issues.".
         seedKeymap("# all comments, nothing to parse\n")
         let reload = app.descendants(matching: .any).matching(identifier: "settings-keymap-reload").firstMatch
         XCTAssertTrue(reload.waitForHittable(timeout: 5), "the Reload button should be hittable")
@@ -298,8 +274,37 @@ final class KeymapUITests: XCTestCase {
         return target
     }
 
-    /// Writes `keymap.conf` under the isolated state dir's `config` directory, before launch, so
-    /// `SettingsModel.loadKeymap` reads it at init (and `ensureStarterKeymap` leaves it untouched).
+    // issue #296: moving close_session OFF ⌘W lets SwiftUI's stock File ▸ Close claim the chord, and
+    // putting it BACK does not reclaim it — SwiftUI unbinds its own item instead. The sequence must run
+    // through RELOAD, never a relaunch: seeding keymap.conf at LAUNCH does not exercise that path.
+    func testCloseSessionReclaimsCommandWAfterReload() throws {
+        seedKeymap("map cmd+e close_session\n")
+        app.launchForUITest()
+        XCTAssertTrue(app.staticTexts["session-row"].firstMatch.waitForExistence(timeout: 20), "seeded session should exist")
+        XCTAssertTrue(poll { self.sessionRowCount() == 1 }, "should start with the one seeded session")
+
+        // a second session, so closing one leaves the window populated — an emptied window legitimately
+        // closes on ⌘W, which would make the assertion below ambiguous.
+        app.typeKey("n", modifierFlags: .command)
+        XCTAssertTrue(poll { self.sessionRowCount() == 2 }, "⌘N should add a second session")
+
+        seedKeymap("")
+        reloadKeymapFromMenu()
+
+        app.typeKey("w", modifierFlags: .command)
+        XCTAssertTrue(poll({ self.sessionRowCount() == 1 }, timeout: 10),
+                      "⌘W should close a session once the override is gone; the stock File ▸ Close must not keep the chord")
+        XCTAssertFalse(app.sheets.firstMatch.exists, "⌘W must not raise the close-window confirmation")
+        XCTAssertEqual(app.state, .runningForeground, "the window must survive")
+    }
+
+    private func reloadKeymapFromMenu() {
+        app.menuBars.menuBarItems["File"].click()
+        let item = app.menuItems["Reload Keymap"]
+        XCTAssertTrue(item.waitForExistence(timeout: 5), "File menu should offer Reload Keymap")
+        item.click()
+    }
+
     private func seedKeymap(_ contents: String) {
         let configDir = stateDir.appendingPathComponent("config", isDirectory: true)
         try? FileManager.default.createDirectory(at: configDir, withIntermediateDirectories: true)
@@ -321,9 +326,6 @@ final class KeymapUITests: XCTestCase {
         let row = app.staticTexts["session-row"].firstMatch
         XCTAssertTrue(row.waitForHittable(timeout: 20), "seeded session should be hittable")
         row.click()
-        // drain the run loop until the row reports selected, so the responder bounce
-        // (mouseDown → focusActiveTerminal) settles before a chord is pressed — a wait-for-condition
-        // rather than a fixed sleep. chordFiresMarker retries anyway, so a slow settle is not fatal.
         let deadline = Date().addingTimeInterval(2)
         while Date() < deadline, row.isSelected == false {
             RunLoop.current.run(until: Date().addingTimeInterval(0.05))

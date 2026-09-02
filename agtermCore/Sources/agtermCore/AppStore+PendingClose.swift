@@ -43,6 +43,10 @@ struct PendingWorkspaceClose {
     let workspace: Workspace
     let workspaceIndex: Int
     let selectedSessionID: UUID?
+    /// Whether the closed workspace was in the sidebar focus set, captured so the undo can put it back INTO
+    /// the set. The filter FLAG deliberately is not: it is current window state, restored by nothing (see
+    /// `AppStore.markFocusMember`).
+    let focusMember: Bool
 }
 
 extension AppStore {
@@ -57,9 +61,9 @@ extension AppStore {
         let wasActive = selectedSessionID == sessionID
         let session = workspaces[location.workspaceIndex].sessions.remove(at: location.sessionIndex)
         emitSessionClosed(session, workspace: workspace.id)
-        // undo reinserts THIS object, so an override payload armed at bootstrap and never consumed would
-        // survive the round trip and fire when the restored session's surface is built. Drop it here; the
-        // persisted pin is untouched and still fires on the next launch.
+        // undo reinserts THIS object, so an override armed at bootstrap and never consumed would survive the
+        // round trip and fire when the restored surface is built. drop it; the persisted pin is untouched
+        // and still fires on the next launch.
         session.clearPendingRestoreOverrides()
         let closeID = UUID()
         let close = PendingSessionClose(
@@ -81,7 +85,7 @@ extension AppStore {
         if wasActive {
             selectedSessionID = closeReselectionTarget(after: location)
             replaceSidebarSelection(with: selectedSessionID)
-            autoUnfocusIfOutsideFocus(selectedSessionID)
+            disableFocusIfSelectionOutsideSet(selectedSessionID)
             recordRecency()
         } else {
             pruneSidebarSelection()
@@ -142,7 +146,7 @@ extension AppStore {
                                                       sessionIndex: close.sessionIndex - removedBeforeActive))
             } ?? workspaces.first(where: { !$0.sessions.isEmpty })?.sessions.first?.id
             replaceSidebarSelection(with: selectedSessionID)
-            autoUnfocusIfOutsideFocus(selectedSessionID)
+            disableFocusIfSelectionOutsideSet(selectedSessionID)
             recordRecency()
         } else {
             pruneSidebarSelection()
@@ -166,19 +170,23 @@ extension AppStore {
     public func softRemoveWorkspace(_ workspaceID: UUID, grace: TimeInterval = AppStore.pendingCloseGraceInterval) -> Bool {
         guard canRemoveWorkspace, let index = workspaces.firstIndex(where: { $0.id == workspaceID }) else { return false }
         let visibleWorkspace = workspaces.remove(at: index)
+        forgetFreshWorkspace(workspaceID)
         for session in visibleWorkspace.sessions { emitSessionClosed(session, workspace: visibleWorkspace.id) }
         if visibleWorkspace.sessions.isEmpty { scheduleTreeChanged() }
-        let workspace = foldingPendingCloses(of: visibleWorkspace)
+        let folded = foldingPendingCloses(of: visibleWorkspace)
+        let workspace = folded.workspace
         for session in workspace.sessions { session.clearPendingRestoreOverrides() } // same undo hazard
         let removingActive = selectedSessionID.map { id in workspace.sessions.contains { $0.id == id } } ?? false
         let restoringSelection = removingActive ? selectedSessionID : nil
-        if focusedWorkspaceID == workspaceID { focusedWorkspaceID = nil }
+        // a superseded record's membership is already gone from the live set — its own close dropped it and
+        // the session undo that rebuilt this workspace as a shell does not re-mark — so its flag is the only
+        // surviving copy and must win here.
+        let focusMember = focusedWorkspaceIDs.contains(workspaceID) || folded.focusMember
+        dropFocusMember(workspaceID)
         if removingActive {
-            let fallbackIndex = min(index, workspaces.count - 1)
-            selectedSessionID = workspaces[fallbackIndex].sessions.first?.id
-                ?? workspaces.first(where: { !$0.sessions.isEmpty })?.sessions.first?.id
+            selectedSessionID = workspaceRemovalTarget(at: index)
             replaceSidebarSelection(with: selectedSessionID)
-            autoUnfocusIfOutsideFocus(selectedSessionID)
+            disableFocusIfSelectionOutsideSet(selectedSessionID)
             recordRecency()
         } else {
             pruneSidebarSelection()
@@ -188,10 +196,12 @@ extension AppStore {
         pendingCloseRecords[closeID] = .workspace(PendingWorkspaceClose(
             workspace: workspace,
             workspaceIndex: index,
-            selectedSessionID: restoringSelection
+            selectedSessionID: restoringSelection,
+            focusMember: focusMember
         ))
         pendingCloseOrder.append(closeID)
-        recordRecentClosedWorkspace(workspace, selectedSessionID: restoringSelection, id: closeID)
+        recordRecentClosedWorkspace(workspace, selectedSessionID: restoringSelection,
+                                    focusMember: focusMember, id: closeID)
         showPendingCloseSummary(id: closeID)
         schedulePendingCloseFinalization(id: closeID, grace: grace)
         cancelPendingSave()
@@ -203,7 +213,7 @@ extension AppStore {
     public func undoPendingClose(_ id: UUID? = nil, selecting sessionID: UUID? = nil) -> Bool {
         let closeID = id ?? pendingCloseSummary?.id
         guard let closeID, let record = pendingCloseRecords.removeValue(forKey: closeID) else { return false }
-        pendingCloseTasks.removeValue(forKey: closeID)?.cancel()
+        pendingCloseCancels.removeValue(forKey: closeID)?()
         pendingCloseOrder.removeAll { $0 == closeID }
         switch record {
         case .sessions(let close):
@@ -220,7 +230,7 @@ extension AppStore {
 
     func finalizePendingClose(_ id: UUID) {
         guard let record = pendingCloseRecords.removeValue(forKey: id) else { return }
-        pendingCloseTasks.removeValue(forKey: id)?.cancel()
+        pendingCloseCancels.removeValue(forKey: id)?()
         pendingCloseOrder.removeAll { $0 == id }
         switch record {
         case .sessions(let close):
@@ -263,39 +273,46 @@ extension AppStore {
         }
     }
 
+    /// Arm the grace timer through the `MainTimer` host seam — NOT a `Task.sleep`, which a host whose main
+    /// loop drains no main-actor executor (the GTK port's GLib loop) would silently never run, leaving the
+    /// undo window open forever and the closed session's surfaces alive.
     private func schedulePendingCloseFinalization(id: UUID, grace: TimeInterval) {
-        pendingCloseTasks[id]?.cancel()
-        let delay = UInt64(max(0, grace) * 1_000_000_000)
-        pendingCloseTasks[id] = Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: delay)
+        pendingCloseCancels[id]?()
+        pendingCloseCancels[id] = MainTimer.schedule(after: max(0, grace)) { [weak self] in
             self?.finalizePendingClose(id)
         }
     }
 
     /// Absorb any pending close of the same workspace into the copy being closed now, dropping the
     /// superseded record. Undoing a session close rebuilds a missing workspace as a shell, so closing that
-    /// shell while the earlier record still waits out its grace would leave two pending records sharing a
-    /// workspace id. Both key one Open Recent entry by that id (`RecentClosedStore.record` dedupes on it),
-    /// so the newer snapshot would evict the older one and its sessions would survive nowhere once both
-    /// records finalize. The copy closed now is the newer state, so its name, expansion and session order
-    /// lead; the superseded record's sessions follow.
-    private func foldingPendingCloses(of workspace: Workspace) -> Workspace {
+    /// shell during the earlier record's grace would leave two pending records sharing a workspace id — and
+    /// both key one Open Recent entry by it (`RecentClosedStore.record` dedupes on it), so the newer
+    /// snapshot would evict the older and its sessions would survive nowhere once both finalize. The copy
+    /// closed now is the newer state, so its name, expansion and session order lead and the superseded
+    /// record's sessions follow. Focus MEMBERSHIP is reported back ORed across every absorbed record,
+    /// because the rebuilt shell carries none; the caller ORs it into its own capture, so the newer record —
+    /// and the Open Recent entry it overwrites — still knows the workspace was a set member.
+    private func foldingPendingCloses(of workspace: Workspace) -> (workspace: Workspace, focusMember: Bool) {
         var folded = workspace
+        var focusMember = false
         for closeID in pendingCloseOrder {
             guard case .workspace(let close)? = pendingCloseRecords[closeID], close.workspace.id == workspace.id else { continue }
             pendingCloseRecords.removeValue(forKey: closeID)
-            pendingCloseTasks.removeValue(forKey: closeID)?.cancel()
+            pendingCloseCancels.removeValue(forKey: closeID)?()
             let present = Set(folded.sessions.map(\.id))
             folded.sessions.append(contentsOf: close.workspace.sessions.filter { !present.contains($0.id) })
+            focusMember = focusMember || close.focusMember
         }
         pendingCloseOrder.removeAll { pendingCloseRecords[$0] == nil }
-        return folded
+        return (folded, focusMember)
     }
 
     /// Session ids a pending close still holds. They are absent from the tree, but their live objects are
     /// intact and an undo reinserts them, so a restore that rebuilt one from a snapshot would put two
-    /// objects under a single id. Callers union this with the tree's ids to decide what is already taken.
-    func pendingHeldSessionIDs() -> Set<UUID> {
+    /// objects under a single id. Callers union this with the tree's ids to decide what is already taken —
+    /// a host that reaps host surfaces the tree no longer names must do the same, or a soft close tears
+    /// down the very shells its undo window promises to bring back.
+    public func pendingHeldSessionIDs() -> Set<UUID> {
         var held: Set<UUID> = []
         for record in pendingCloseRecords.values {
             switch record {
@@ -309,9 +326,8 @@ extension AppStore {
     }
 
     /// A workspace to stand in for one a restore needs but the tree no longer holds. Prefer the newest
-    /// description of it: a pending close of that same workspace carries its live name and expansion state,
-    /// and once those finalize an Open Recent snapshot still does. `name` is the caller's older copy, used
-    /// only when neither describes the workspace.
+    /// description: a pending close of that same workspace carries its live name and expansion state, and
+    /// once those finalize an Open Recent snapshot still does. `name` is the caller's older copy, a last resort.
     func rebuiltWorkspaceShell(id: UUID, name: String) -> Workspace {
         for closeID in pendingCloseOrder.reversed() {
             guard case .workspace(let close)? = pendingCloseRecords[closeID], close.workspace.id == id else { continue }
@@ -334,6 +350,12 @@ extension AppStore {
         }
         let insertAt = max(0, min(close.sessionIndex, workspaces[workspaceIndex].sessions.count))
         workspaces[workspaceIndex].sessions.insert(close.session, at: insertAt)
+        // the deck's `dropUnrealizedPaneOverlays` watchers are unmounted while the session sits outside the
+        // tree, and `.onChange` does not fire on the remount, so the last host of a pane overlay can go away
+        // unobserved: the zoom layer clears a target whose session it can no longer resolve, and a stillborn
+        // slot that target was sparing comes back marked open with no surface and no program. Reconcile the
+        // SAME object being reinserted; a snapshot rebuild (`session(from:)`) carries no pane overlays.
+        close.session.dropUnrealizedPaneOverlays()
         emitSessionCreated(close.session, workspace: close.workspaceID)
     }
 
@@ -347,7 +369,7 @@ extension AppStore {
         if let target {
             selectedSessionID = target
             replaceSidebarSelection(with: selectedSessionID)
-            autoUnfocusIfOutsideFocus(selectedSessionID)
+            disableFocusIfSelectionOutsideSet(selectedSessionID)
             recordRecency()
         }
     }
@@ -358,28 +380,37 @@ extension AppStore {
     }
 
     private func restorePendingWorkspace(_ close: PendingWorkspaceClose) {
-        // an undone session close, or an Open Recent restore, rebuilds a missing workspace by id as a
-        // shell holding just that session. merge into the shell instead of inserting a second workspace
-        // sharing its id: every id-keyed lookup resolves the first match, so a duplicate would strand the
-        // other copy's sessions. the shell was seeded from this record, and anything the user changed on
-        // it since is newer, so its name and expansion state stand. the shell also keeps its slot, so
-        // `workspaceIndex` and this record's session order are not honored. the filter is defensive: a
-        // session held by this record cannot already be live elsewhere.
+        // an undone session close, or an Open Recent restore, rebuilds a missing workspace by id as a shell
+        // holding just that session. merge into the shell rather than inserting a second workspace sharing
+        // its id: every id-keyed lookup resolves the first match, so a duplicate strands the other copy's
+        // sessions. the shell was seeded from this record and anything changed on it since is newer, so its
+        // name and expansion state stand, and it keeps its slot — `workspaceIndex` and this record's session
+        // order are not honored. the filter is defensive: a session held here cannot already be live elsewhere.
         if let existing = workspaces.firstIndex(where: { $0.id == close.workspace.id }) {
             let live = Set(workspaces.flatMap(\.sessions).map(\.id))
             let restored = close.workspace.sessions.filter { !live.contains($0.id) }
             workspaces[existing].sessions.append(contentsOf: restored)
-            for session in restored { emitSessionCreated(session, workspace: workspaces[existing].id) }
+            for session in restored {
+                session.dropUnrealizedPaneOverlays() // reinserted live objects, as in `restorePendingSession`
+                emitSessionCreated(session, workspace: workspaces[existing].id)
+            }
         } else {
             let insertAt = max(0, min(close.workspaceIndex, workspaces.count))
             workspaces.insert(close.workspace, at: insertAt)
-            for session in close.workspace.sessions { emitSessionCreated(session, workspace: close.workspace.id) }
+            for session in close.workspace.sessions {
+                session.dropUnrealizedPaneOverlays() // as above
+                emitSessionCreated(session, workspace: close.workspace.id)
+            }
             if close.workspace.sessions.isEmpty { scheduleTreeChanged() }
         }
+        // re-mark BEFORE the reselect below, so a restored member is inside the set when
+        // `disableFocusIfSelectionOutsideSet` runs, and ahead of the `guard` — an EMPTY workspace returns
+        // there, and skipping the re-mark would leave its row filtered out, making the undo look a no-op.
+        if close.focusMember { markFocusMember(close.workspace.id) }
         guard let target = close.selectedSessionID ?? close.workspace.sessions.first?.id else { return }
         selectedSessionID = target
         replaceSidebarSelection(with: selectedSessionID)
-        autoUnfocusIfOutsideFocus(selectedSessionID)
+        disableFocusIfSelectionOutsideSet(selectedSessionID)
         recordRecency()
     }
 
@@ -387,7 +418,9 @@ extension AppStore {
         session.surface?.teardown()
         session.splitSurface?.teardown()
         session.overlaySurface?.teardown()
+        session.teardownPaneOverlays()
         session.scratchSurface?.teardown()
+        session.discardHudBody() // a HUD whose surface never realized has no teardown to delete its body file
         WatermarkStorage.removeRenderedText(sessionID: session.id)
         removeFromRecency(session.id)
     }

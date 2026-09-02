@@ -13,14 +13,21 @@ import Glibc
 final class ControlServer: @unchecked Sendable {
     let path: String
     private var listenFD: Int32 = -1
+    private var lockFD: Int32 = -1
+    private var refused = false
     private static let maxLine = 1 << 20
     private static let readTimeoutMS: Int32 = 5_000
+    static let unavailableSuffix = ".unavailable"
 
     /// The socket path once actually bound (nil before bind / after a bind failure), so a spawned
     /// shell's `AGTERM_SOCKET` only advertises a socket that exists. Mirrors macOS `boundSocketPath`.
     var boundSocketPath: String? { listenFD >= 0 ? path : nil }
+    var resolvedSocketPath: String { refused ? path + Self.unavailableSuffix : path }
 
-    init() { path = Self.defaultSocketPath() }
+    init(path: String? = nil) {
+        self.path = path ?? Self.defaultSocketPath()
+        _ = acquireOwnership()
+    }
 
     static func defaultSocketPath() -> String {
         ControlResolve.socketPath(stateDir: ProcessInfo.processInfo.environment["AGTERM_STATE_DIR"],
@@ -28,10 +35,12 @@ final class ControlServer: @unchecked Sendable {
     }
 
     func start() {
+        guard listenFD < 0 else { return }
         signal(SIGPIPE, SIG_IGN)
+        guard path.utf8.count < 104 else { return }
+        guard lockFD >= 0 || acquireOwnership() else { return }
         let fd = socket(AF_UNIX, Int32(SOCK_STREAM.rawValue), 0)
         guard fd >= 0 else { return }
-        guard path.utf8.count < 104 else { close(fd); return }
 
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
@@ -54,6 +63,40 @@ final class ControlServer: @unchecked Sendable {
         listenFD = fd
         Thread.detachNewThread { [self] in acceptLoop(fd) }
         FileHandle.standardError.write(Data("agterm: control socket at \(path)\n".utf8))
+    }
+
+    func stop() {
+        defer { releaseOwnership() }
+        guard listenFD >= 0 else { return }
+        close(listenFD)
+        listenFD = -1
+        unlink(path)
+    }
+
+    private func acquireOwnership() -> Bool {
+        let lockPath = path + ".lock"
+        let fd = open(lockPath, O_CREAT | O_RDWR | O_CLOEXEC, 0o600)
+        guard fd >= 0 else {
+            FileHandle.standardError.write(Data("agterm: could not open control lock \(lockPath)\n".utf8))
+            return false
+        }
+        guard flock(fd, LOCK_EX | LOCK_NB) == 0 else {
+            close(fd)
+            refused = true
+            FileHandle.standardError.write(
+                Data("agterm: control socket already owned; refusing \(path)\n".utf8)
+            )
+            return false
+        }
+        lockFD = fd
+        refused = false
+        return true
+    }
+
+    private func releaseOwnership() {
+        guard lockFD >= 0 else { return }
+        close(lockFD)
+        lockFD = -1
     }
 
     private func acceptLoop(_ fd: Int32) {
@@ -133,9 +176,12 @@ final class ControlServer: @unchecked Sendable {
         switch req.cmd {
         case .sessionClose, .sessionDuplicate, .sessionSelect, .sessionGo, .sessionRename, .sessionReveal,
              .sessionMove, .sessionType,
-             .sessionStatus, .sessionRestore, .sessionFlag, .sessionSeen, .sessionSplit, .sessionScratch, .sessionFocus,
+             .sessionStatus, .sessionRestore, .sessionFlag, .sessionSeen,
+             .sessionSplit, .sessionSplitClose, .sessionScratch, .sessionFocus,
              .sessionCopy, .sessionPaste, .sessionSelectAll, .sessionSearch,
              .sessionOverlayOpen, .sessionOverlayClose, .sessionOverlayResize, .sessionOverlayResult,
+             .sessionOverlayCopy, .sessionOverlayText,
+             .sessionHudOpen, .sessionHudUpdate, .sessionHudClose,
              .sessionBackground, .sessionResize, .sessionText, .notify,
              .fontInc, .fontDec, .fontReset:
             return routeOwningSession(req.target) ?? .controller(gController)
@@ -144,11 +190,14 @@ final class ControlServer: @unchecked Sendable {
             return routeOwningWorkspace(req.target) ?? .controller(gController)
         case .sessionNew:
             return routeOwningWorkspace(req.args?.workspace) ?? .controller(gController)
-        case .tree, .eventsRead, .workspaceNew, .quick, .quickType, .quickText, .surfaceZoom, .dashboard,
-             .sidebar, .sidebarMode, .sidebarExpand, .sidebarCollapse,
+        case .surfaceZoom, .surfaceCursor:
+            return routeOwningSurface(req.target) ?? .controller(gController)
+        case .tree, .eventsRead, .workspaceNew, .workspaceGo, .quick, .quickType, .quickText, .dashboard,
+             .sidebar, .sidebarMode, .sidebarExpand, .sidebarCollapse, .workspaceFilter,
              .windowNew, .windowList, .windowSelect, .windowClose, .windowRename, .windowDelete,
-             .windowResize, .windowMove, .windowZoom, .windowFullscreen,
-             .keymapReload, .configReload, .themeSet, .themeList, .restoreClear, .debugAppearance:
+             .windowResize, .windowMove, .windowZoom, .windowFullscreen, .windowMinimize,
+             .keymapReload, .keymapList, .configReload, .themeSet, .themeList,
+             .pickOpen, .pickResult, .pickCancel, .restoreClear, .debugAppearance:
             return .controller(gController)
         }
     }
@@ -171,6 +220,12 @@ final class ControlServer: @unchecked Sendable {
         case .notFound:
             return .failure(ControlResolve.notFoundMessage(noun: "session", target: target))
         }
+    }
+
+    @MainActor private static func routeOwningSurface(_ target: String?) -> ControllerRoute? {
+        guard let target = explicitTarget(target), target != "quick",
+              let surfaceID = TerminalSurfaceID(rawValue: target) else { return nil }
+        return routeOwningSession(surfaceID.sessionID.uuidString)
     }
 
     @MainActor private static func routeOwningWorkspace(_ target: String?) -> ControllerRoute? {

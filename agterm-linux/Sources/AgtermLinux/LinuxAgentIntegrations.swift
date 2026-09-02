@@ -19,6 +19,7 @@ extension AppController {
         addIntegrationRow(.claudeHooks, plan: .hooks, to: hooks)
         addIntegrationRow(.codexHooks, plan: .hooks, to: hooks)
         addIntegrationRow(.piHooks, plan: .hooks, to: hooks)
+        addIntegrationRow(.opencodePlugin, plan: .hooks, to: hooks)
         adw_preferences_page_add(cast(page), cast(hooks))
 
         let skill = preferencesGroup("Agent Skill")

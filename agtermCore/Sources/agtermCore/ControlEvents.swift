@@ -17,16 +17,21 @@ public struct ControlEventPayload: Codable, Sendable, Equatable {
     public var pane: String?
     public var blink: Bool?
     public var color: String?
+    /// The `status` event's per-call glyph silhouette (a `StatusShape` raw value), nil when the glyph uses the
+    /// Settings shape / default plain circle. A shape-only change emits a `status` event, unexplainable without it.
+    public var shape: String?
     public var title: String?
     public var body: String?
 
     public init(name: String? = nil, status: String? = nil, pane: String? = nil,
-                blink: Bool? = nil, color: String? = nil, title: String? = nil, body: String? = nil) {
+                blink: Bool? = nil, color: String? = nil, shape: String? = nil,
+                title: String? = nil, body: String? = nil) {
         self.name = name
         self.status = status
         self.pane = pane
         self.blink = blink
         self.color = color
+        self.shape = shape
         self.title = title
         self.body = body
     }

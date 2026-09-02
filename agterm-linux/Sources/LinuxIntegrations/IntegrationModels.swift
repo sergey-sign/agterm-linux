@@ -5,6 +5,7 @@ public enum IntegrationKind: String, Codable, CaseIterable, Sendable {
     case claudeHooks = "claude-hooks"
     case codexHooks = "codex-hooks"
     case piHooks = "pi-hooks"
+    case opencodePlugin = "opencode-plugin"
     case agentSkill = "agent-skill"
 
     public var title: String {
@@ -13,6 +14,7 @@ public enum IntegrationKind: String, Codable, CaseIterable, Sendable {
         case .claudeHooks: return "Claude Code Hooks"
         case .codexHooks: return "Codex Hooks"
         case .piHooks: return "Pi Extension"
+        case .opencodePlugin: return "OpenCode Plugin"
         case .agentSkill: return "Agent Skill"
         }
     }

@@ -2,6 +2,23 @@ import AppKit
 import Darwin
 import XCTest
 
+@MainActor
+extension XCTestCase {
+    /// The shared waiting idiom: re-evaluate `condition` on a drained run loop until it holds or `timeout`
+    /// expires. `@autoclosure` so a caller reads as a plain expression, and a drained run loop (rather than
+    /// `usleep`) so the runner keeps servicing the AX queries and socket round-trips the condition makes.
+    /// Lives on `XCTestCase` rather than on `ControlAPITestCase` so the suites that do NOT need the control
+    /// harness (`FocusWorkspaceUITests`) share the one loop too.
+    func poll(until condition: @autoclosure () -> Bool, timeout: TimeInterval) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() { return true }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+        }
+        return condition()
+    }
+}
+
 /// Shared XCUITest harness for the programmatic control-channel e2e suites: launches the real app
 /// with an isolated `AGTERM_STATE_DIR` (which also locates the unix socket at `<stateDir>/agterm.sock`),
 /// speaks the socket directly from the test process (one newline-delimited JSON request → one response
@@ -21,22 +38,18 @@ class ControlAPITestCase: XCTestCase {
         markerDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("agterm-ctlmarker-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: markerDir, withIntermediateDirectories: true)
-        // socket path constraints: it must be (a) under the unix-socket sun_path ~104-byte limit and
-        // (b) inside the runner's sandbox grant. The per-test AGTERM_STATE_DIR subdir pushes the path to
-        // ~135 bytes (too long), and /tmp is outside the runner sandbox (connect → EPERM). The runner's
-        // own temp dir (NSTemporaryDirectory(), ~81 bytes) with a short filename satisfies both.
+        // the runner's own temp dir keeps the socket path under the sun_path ~104-byte limit AND inside
+        // the sandbox grant (the per-test AGTERM_STATE_DIR subdir is ~135 bytes; /tmp gives EPERM).
         socketPath = (NSTemporaryDirectory() as NSString)
             .appendingPathComponent("agtermc-\(UUID().uuidString.prefix(8)).sock")
         app = XCUIApplication()
         app.launchEnvironment["AGTERM_STATE_DIR"] = stateDir.path
         app.launchEnvironment["AGTERM_CONTROL_SOCKET"] = socketPath
-        // Pin the title-bar double-click action so the header gesture tests are hermetic regardless of
-        // the host's Desktop & Dock setting (the app honors this env override in
-        // performTitlebarDoubleClickAction; launch args can't carry it — FB11763863). Most tests never
-        // double-click, so the value is irrelevant to them; the no-op-case test opts into "None".
-        // (that test, testDoubleClickHeaderHonorsNoneSetting, now lives in ControlWindowUITests.)
+        // pin the title-bar double-click action so the header gesture tests are hermetic regardless of
+        // the host's Desktop & Dock setting; launch args can't carry it — FB11763863.
         app.launchEnvironment["AGTERM_UITEST_DOUBLECLICK_ACTION"] =
             name.contains("testDoubleClickHeaderHonorsNoneSetting") ? "None" : "Maximize"
+        try seedSettingsIfNeeded()
         app.launchForUITest()
         // the seeded session row proves the window (and thus the control server's scene .task) is up.
         XCTAssertTrue(app.staticTexts["session-row"].waitForExistence(timeout: 30), "seeded session should exist")
@@ -47,6 +60,20 @@ class ControlAPITestCase: XCTestCase {
         if let stateDir { try? FileManager.default.removeItem(at: stateDir) }
         if let socketPath { try? FileManager.default.removeItem(atPath: socketPath) }
         if let markerDir { try? FileManager.default.removeItem(at: markerDir) }
+    }
+
+    /// Settings to write into the isolated state dir's `settings.json` before launch. Nil (the default)
+    /// launches with stock defaults. Override to start the app with a non-default setting — the control
+    /// channel has no `settings.*` command, so pre-seeding the file is the only way to exercise one
+    /// without driving the Settings window.
+    var seededSettings: [String: Any]? { nil }
+
+    /// Write `seededSettings` into the state dir before launch, so `SettingsModel.init` picks it up.
+    private func seedSettingsIfNeeded() throws {
+        guard let seededSettings else { return }
+        try FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
+        let data = try JSONSerialization.data(withJSONObject: seededSettings)
+        try data.write(to: stateDir.appendingPathComponent("settings.json"))
     }
 
     /// Polls until the sidebar shows exactly `expected` `session-row` elements.
@@ -67,6 +94,57 @@ class ControlAPITestCase: XCTestCase {
         let t = try XCTUnwrap(result["tree"] as? [String: Any], "result should carry a tree")
         let ws = try XCTUnwrap((t["workspaces"] as? [[String: Any]])?.first, "should have a workspace")
         return try XCTUnwrap((ws["sessions"] as? [[String: Any]])?.first?["id"] as? String, "seeded session id")
+    }
+
+    /// One session's node from a FRESH `tree`, searched across every workspace — the read-back oracle for
+    /// the state a command just set. Re-sends `tree` on every call, so a test can poll a mutation, and
+    /// fails when the session is absent rather than returning a nil field that would read as "unset".
+    /// Use `sessionNodeIfPresent(id:)` where absence is a legitimate intermediate state.
+    func sessionNode(id: String) throws -> [String: Any] {
+        let sessions = try XCTUnwrap(sessionNodes(), "tree should carry a workspace/session list")
+        return try XCTUnwrap(sessions.first { matchesID($0, id) }, "session \(id) should be in the tree")
+    }
+
+    /// The tolerant twin of `sessionNode(id:)`: nil for an absent session AND for a response that carries
+    /// no readable tree, instead of failing. A polling loop needs this — a helper that throws on a
+    /// transient miss ends the test instead of taking the next tick.
+    func sessionNodeIfPresent(id: String) throws -> [String: Any]? {
+        try sessionNodes()?.first { matchesID($0, id) }
+    }
+
+    /// Every session node from a FRESH `tree`, flattened across all workspaces; nil when the response
+    /// carries no readable tree.
+    private func sessionNodes() throws -> [[String: Any]]? {
+        let tree = try sendCommand(#"{"cmd":"tree"}"#)
+        guard let result = tree["result"] as? [String: Any],
+              let workspaces = (result["tree"] as? [String: Any])?["workspaces"] as? [[String: Any]]
+        else { return nil }
+        return workspaces.flatMap { $0["sessions"] as? [[String: Any]] ?? [] }
+    }
+
+    /// Case-insensitive session id match — a `tree` id and a caller-supplied one can differ in case.
+    private func matchesID(_ session: [String: Any], _ id: String) -> Bool {
+        (session["id"] as? String)?.lowercased() == id.lowercased()
+    }
+
+    /// Polls the session node's `split` (isSplit) read-back until true.
+    func pollSplit(_ id: String, timeout: TimeInterval) throws -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if try sessionNodeIfPresent(id: id)?["split"] as? Bool == true { return true }
+            usleep(200_000)
+        }
+        return try sessionNodeIfPresent(id: id)?["split"] as? Bool == true
+    }
+
+    /// Polls the session node's `splitFocused` read-back until it equals `expected`.
+    func pollSplitFocused(_ id: String, expected: Bool, timeout: TimeInterval) throws -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if try sessionNodeIfPresent(id: id)?["splitFocused"] as? Bool == expected { return true }
+            usleep(200_000)
+        }
+        return try sessionNodeIfPresent(id: id)?["splitFocused"] as? Bool == expected
     }
 
     /// Terminate the running app, write `snapshot` as the (single) window's per-window snapshot file,
@@ -179,20 +257,42 @@ class ControlAPITestCase: XCTestCase {
         return nil
     }
 
-    /// Inject `command` (which redirects to `file`) and wait for the shell to write it back, retrying the
-    /// inject if the marker hasn't appeared yet. A freshly-realized surface's shell/pty may not be ready to
-    /// read when the first keystrokes land (especially under full-suite CPU load), so a single injection can
-    /// be dropped — re-injecting once the shell has had time to spawn is the deterministic readiness wait.
+    /// Inject `command` (which redirects to `file`) and wait for the shell to write it back, re-injecting
+    /// while the marker is missing. The keystrokes are not dropped — they queue to the pty and the kernel
+    /// buffers them — but a freshly-realized surface's shell can take longer than one attempt's poll to spawn
+    /// and run them under full-suite CPU load, so the retries buy time rather than re-deliver lost text.
     /// The marker file is the readiness signal: when it's non-empty the command actually ran. Returns the
     /// marker contents, or nil if it never appeared across all attempts. Asserts each type request returns ok.
-    func typeUntilMarker(_ command: String, target: String, file: URL, select: Bool,
+    func typeUntilMarker(_ command: String, target: String, file: URL, select: Bool, pane: String? = nil,
                          attempts: Int = 4, perAttempt: TimeInterval = 4) throws -> String? {
         for attempt in 0..<attempts {
             // clear any marker a prior attempt's late injection may have written, so a stale value
             // can't be read as this attempt's success.
             try? FileManager.default.removeItem(at: file)
-            let typed = try sendCommand(typeRequest(text: command, target: target, select: select))
-            XCTAssertEqual(typed["ok"] as? Bool, true, "typing the probe (attempt \(attempt)) should succeed: \(typed)")
+            let typed = try sendCommand(typeRequest(text: command, target: target, select: select, pane: pane))
+            if typed["ok"] as? Bool != true {
+                // `session not realized` is the same readiness race this loop exists to absorb — a background
+                // session's surface is built lazily, so an early probe can arrive before it exists. Any OTHER
+                // error is a real failure. Exhausting every attempt returns nil, which the callers unwrap.
+                XCTAssertTrue((typed["error"] as? String ?? "").contains("not realized"),
+                              "typing the probe (attempt \(attempt)) should succeed: \(typed)")
+                usleep(300_000)
+                continue
+            }
+            if let value = pollMarker(file, timeout: perAttempt) { return value }
+        }
+        return nil
+    }
+
+    /// `typeUntilMarker`'s KEYBOARD twin: types through the real keyboard, so the marker names whichever
+    /// surface actually holds first responder — the only oracle for a focus move. Retried for the same
+    /// shell-readiness reason.
+    func keyboardTypeUntilMarker(_ command: String, file: URL,
+                                 attempts: Int = 6, perAttempt: TimeInterval = 2.5) -> String? {
+        for _ in 0..<attempts {
+            try? FileManager.default.removeItem(at: file)
+            app.typeText(command)
+            app.typeKey(.return, modifierFlags: [])
             if let value = pollMarker(file, timeout: perAttempt) { return value }
         }
         return nil

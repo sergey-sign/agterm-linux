@@ -17,12 +17,19 @@ public protocol ControlActions {
     func revealSession(_ target: String?, window: String?) -> ControlResponse
     func createWorkspace(window: String?, name: String?, collapsed: Bool) -> ControlResponse
     func selectWorkspace(_ target: String?, window: String?) -> ControlResponse
+    /// Step the placement store's CURRENT workspace one place through the sidebar's visible order, selecting
+    /// the destination's first session when it has one — an EMPTY destination becomes current with the
+    /// selection left where it was. Relative, so no target: the counterpart of `session.go` one level up.
+    func goWorkspace(window: String?, direction: WorkspaceNavigation) -> ControlResponse
     func renameWorkspace(_ target: String?, window: String?, name: String) -> ControlResponse
     func deleteWorkspace(_ target: String?, window: String?) -> ControlResponse
     func moveSession(_ target: String?, window: String?, move: ControlSessionMove) -> ControlResponse
     func moveSessions(_ targets: [String], window: String?, move: ControlSessionMove) -> ControlResponse
     func moveWorkspace(_ target: String?, window: String?, direction: ReorderDirection) -> ControlResponse
-    func focusWorkspace(_ target: String?, window: String?, mode: String?) -> ControlResponse
+    func focusWorkspace(_ target: String?, window: String?, mode: ControlWorkspaceFocusMode) -> ControlResponse
+    /// Turn a window's workspace focus filter on/off WITHOUT touching the marked set. Window-scoped, so
+    /// it takes no workspace target — the host resolves the store from `window` (frontmost when nil).
+    func setWorkspaceFilter(window: String?, mode: ControlToggleMode) -> ControlResponse
     func setWorkspaceExpansion(_ target: String?, window: String?, expanded: Bool) -> ControlResponse
     func setSessionFlag(_ target: String?, window: String?, mode: String?) -> ControlResponse
     func markSessionSeen(_ target: String?, window: String?) -> ControlResponse
@@ -33,15 +40,26 @@ public protocol ControlActions {
     /// unresolvable `paneID` given without an explicit `pane`).
     func setSessionRestore(_ target: String?, window: String?,
                            update: ControlSessionRestoreUpdate) -> ControlResponse
+    /// Source-compatible axis-agnostic entry point retained for existing conformers and callers.
     func splitSession(_ target: String?, window: String?, mode: String?) -> ControlResponse
+    /// Axis-aware entry point. Its default delegates to the original method so an existing conformer does
+    /// not have to implement the new requirement until it needs axis support.
+    func splitSession(_ target: String?, window: String?, mode: String?, axis: SplitAxis?) -> ControlResponse
+    /// Tear the split pane down rather than hide it, the write side `splitSession`'s `on|off|toggle` cannot
+    /// express: the surface dies and `hasSplit`/`splitRatio`/`splitFocused` go nil in `tree`.
+    func closeSessionSplit(_ target: String?, window: String?) -> ControlResponse
     func scratchSession(_ target: String?, window: String?, mode: String?, command: String?) -> ControlResponse
     func focusSessionPane(_ target: String?, window: String?, pane: String?) -> ControlResponse
     func resizeSplit(_ target: String?, window: String?, resize: ControlSplitResize) -> ControlResponse
     func setSurfaceZoom(_ target: String?, window: String?, mode: ControlToggleMode) -> ControlResponse
+    /// The addressed surface's cursor column. Takes `surface.zoom`'s target vocabulary, `quick` included,
+    /// because it addresses the same set of surfaces; unlike zoom it is a pure read and changes nothing.
+    func readSurfaceCursor(_ target: String?, window: String?) -> ControlResponse
     func setDashboard(targets: [String], window: String?, close: Bool,
                       fontMode: DashboardFontMode, mru: Bool) -> ControlResponse
     func font(_ target: String?, window: String?, pane: String?, action: String) -> ControlResponse
     func reloadKeymap() -> ControlResponse
+    func listKeymap() -> ControlResponse
     func reloadGhosttyConfig() -> ControlResponse
     func sendNotification(_ target: String?, window: String?, title: String?, body: String) -> ControlResponse
     func setTheme(args: ControlArgs?) -> ControlResponse
@@ -61,13 +79,29 @@ public protocol ControlActions {
                        text: String?, to: String?) async -> ControlResponse
     func openSessionOverlay(_ target: String?, window: String?,
                             options: ControlSessionOverlayOpenOptions) -> ControlResponse
-    func closeSessionOverlay(_ target: String?, window: String?) -> ControlResponse
+    func closeSessionOverlay(_ target: String?, window: String?, pane: OverlayPane?) -> ControlResponse
     func resizeSessionOverlay(_ target: String?, window: String?, sizePercent: Int?) -> ControlResponse
-    func sessionOverlayResult(_ target: String?, window: String?) -> ControlResponse
+    func sessionOverlayResult(_ target: String?, window: String?, pane: OverlayPane?) -> ControlResponse
+    /// The overlay's own current selection, the arm `session.copy` cannot reach: that one addresses the pane
+    /// UNDER the overlay, and the selection the user made is on the surface covering it. `pane` nil reads
+    /// the session-wide overlay.
+    func copySessionOverlaySelection(_ target: String?, window: String?, pane: OverlayPane?) -> ControlResponse
+    /// The overlay's own terminal buffer, `session.text`'s counterpart for the covering surface. A TUI's
+    /// buffer is its drawn screen, so this reads what is rendered, not what the program would print.
+    func readSessionOverlayText(_ target: String?, window: String?,
+                                options: ControlSessionOverlayTextOptions) -> ControlResponse
+    /// Post a message panel over the session, occupying the same overlay slot a program overlay uses. The
+    /// dispatcher validated the text, color, percent, and position; the host measures the terminal font,
+    /// renders the message to a file, and drives the store.
+    func openHud(_ target: String?, window: String?, spec: HudSpec) -> ControlResponse
+    /// Replace a live panel's text in place — same surface, no respawn. `spec.backgroundColor` cannot change
+    /// here, the surface having read it once at creation.
+    func updateHud(_ target: String?, window: String?, spec: HudSpec) -> ControlResponse
+    func closeHud(_ target: String?, window: String?) -> ControlResponse
     func setSessionBackground(_ target: String?, window: String?,
                               options: ControlSessionBackgroundOptions) -> ControlResponse
     func readSessionText(_ target: String?, window: String?, options: ControlSessionTextOptions) -> ControlResponse
-    func windowNew(name: String?) -> ControlResponse
+    func windowNew(name: String?, minimized: Bool) async -> ControlResponse
     func windowList() -> ControlResponse
     func windowSelect(_ target: String?) async -> ControlResponse
     func windowClose(_ target: String?) async -> ControlResponse
@@ -77,7 +111,20 @@ public protocol ControlActions {
     func windowMove(_ target: String?, x: Int, y: Int, display: Int?) -> ControlResponse
     func windowZoom(_ target: String?) -> ControlResponse
     func windowFullscreen(_ target: String?) -> ControlResponse
+    func windowMinimize(_ target: String?, mode: ControlToggleMode) async -> ControlResponse
+    /// Open a native picker. The host owns window resolution, registry lookup, and presentation.
+    func openPick(_ pick: PendingPick, window: String?, follow: Bool) -> ControlResponse
+    /// Read a native picker's current result. The host owns window resolution and registry lookup.
+    func pickResult(_ target: String, window: String?) -> ControlResponse
+    /// Cancel a native picker. The host owns window resolution, registry lookup, and dismissal.
+    func cancelPick(_ target: String, window: String?) -> ControlResponse
     func clearRestoreCommands() -> ControlResponse
+}
+
+public extension ControlActions {
+    func splitSession(_ target: String?, window: String?, mode: String?, axis _: SplitAxis?) -> ControlResponse {
+        splitSession(target, window: window, mode: mode)
+    }
 }
 
 public struct ControlSessionTypeOptions: Equatable, Sendable {
@@ -99,15 +146,19 @@ public struct ControlSessionOverlayOpenOptions: Equatable, Sendable {
     public let sizePercent: Int?
     public let backgroundColor: String?
     public let follow: Bool
+    /// The pane to cover, nil for the session-wide overlay. A pane overlay is always full, so this and
+    /// `sizePercent` are mutually exclusive (rejected in the dispatcher).
+    public let pane: OverlayPane?
 
     public init(command: String, cwd: String?, wait: Bool, sizePercent: Int?, backgroundColor: String?,
-                follow: Bool = false) {
+                follow: Bool = false, pane: OverlayPane? = nil) {
         self.command = command
         self.cwd = cwd
         self.wait = wait
         self.sizePercent = sizePercent
         self.backgroundColor = backgroundColor
         self.follow = follow
+        self.pane = pane
     }
 }
 
@@ -131,11 +182,26 @@ public struct ControlSessionTextOptions: Equatable, Sendable {
     }
 }
 
+/// `session.overlay.text`'s inputs. `pane` is the parsed `OverlayPane` rather than
+/// `ControlSessionTextOptions`' raw string: the overlay family takes only `left`/`right`, so the dispatcher
+/// resolves it and the host never re-parses a vocabulary it could widen by accident.
+public struct ControlSessionOverlayTextOptions: Equatable, Sendable {
+    public let pane: OverlayPane?
+    public let all: Bool
+    public let lines: Int?
+
+    public init(pane: OverlayPane?, all: Bool, lines: Int?) {
+        self.pane = pane
+        self.all = all
+        self.lines = lines
+    }
+}
+
 /// Routes control commands through a host-provided action seam. The dispatcher owns command parsing and
 /// response shape; host actions keep target resolution, AppKit state, and terminal-surface side effects.
 @MainActor
 public struct ControlDispatcher {
-    private let actions: any ControlActions
+    let actions: any ControlActions
 
     public init(actions: any ControlActions) {
         self.actions = actions
@@ -150,28 +216,34 @@ public struct ControlDispatcher {
         case .sessionNew, .sessionDuplicate, .sessionSelect, .sessionGo, .sessionClose, .sessionRename,
                 .sessionReveal, .sessionMove, .sessionFlag, .sessionSeen, .sessionStatus, .sessionRestore:
             return dispatchSessionCommand(request)
-        case .sessionSplit, .sessionScratch, .sessionFocus, .sessionResize, .surfaceZoom, .sessionType,
+        case .sessionSplit, .sessionSplitClose, .sessionScratch, .sessionFocus, .sessionResize,
+                .surfaceZoom, .surfaceCursor, .sessionType,
                 .sessionCopy, .sessionPaste, .sessionSelectAll, .sessionSearch, .sessionOverlayOpen,
-                .sessionOverlayClose, .sessionOverlayResize, .sessionOverlayResult, .sessionBackground,
+                .sessionOverlayClose, .sessionOverlayResize, .sessionOverlayResult, .sessionOverlayCopy,
+                .sessionOverlayText, .sessionBackground,
                 .sessionText:
             return await dispatchSessionSurfaceCommand(request)
-        case .workspaceNew, .workspaceSelect, .workspaceRename, .workspaceDelete,
-                .workspaceMove, .workspaceFocus, .workspaceCollapse, .workspaceExpand:
+        case .workspaceNew, .workspaceSelect, .workspaceGo, .workspaceRename, .workspaceDelete,
+                .workspaceMove, .workspaceFocus, .workspaceFilter, .workspaceCollapse, .workspaceExpand:
             return dispatchWorkspaceCommand(request)
-        case .quick, .fontInc, .fontDec, .fontReset, .keymapReload,
+        case .quick, .fontInc, .fontDec, .fontReset, .keymapReload, .keymapList,
                 .configReload, .notify, .themeSet, .themeList, .sidebar, .sidebarMode, .sidebarExpand,
                 .sidebarCollapse, .restoreClear:
             return dispatchAppCommand(request)
         case .quickType, .quickText:
             return await dispatchQuickCommand(request)
         case .windowNew, .windowList, .windowSelect, .windowClose, .windowRename,
-                .windowDelete, .windowResize, .windowMove, .windowZoom, .windowFullscreen:
+                .windowDelete, .windowResize, .windowMove, .windowZoom, .windowFullscreen, .windowMinimize:
             return await dispatchWindowCommand(request)
         case .dashboard:
             return dispatchDashboard(request)
         case .debugAppearance:
             // UI-test-only seam handled app-side in `ControlServer` (needs AppKit + `ContentView.isUITestLaunch`).
             return nil
+        case .pickOpen, .pickResult, .pickCancel:
+            return dispatchPickCommand(request)
+        case .sessionHudOpen, .sessionHudUpdate, .sessionHudClose:
+            return dispatchHudCommand(request)
         }
     }
 
@@ -253,7 +325,6 @@ public struct ControlDispatcher {
         case .sessionSelect:
             return actions.selectSession(request.target, window: request.args?.window)
         case .sessionGo:
-            // unknown/missing `to` is a structured error.
             guard let dir = (request.args?.to).flatMap(SessionNavigation.init(wire:)) else {
                 return ControlResponse(ok: false, error: "session.go requires --to next|prev|first|last|next-attention|prev-attention")
             }
@@ -324,6 +395,13 @@ public struct ControlDispatcher {
             if let color = request.args?.color, !WatermarkConfig.isValidColorHex(color) {
                 return ControlResponse(ok: false, error: "invalid color (expected #rrggbb)")
             }
+            var shape: StatusShape?
+            if let raw = request.args?.shape {
+                guard let parsed = StatusShape(rawValue: raw) else {
+                    return ControlResponse(ok: false, error: "invalid shape: \(raw) (\(StatusShape.validNamesList))")
+                }
+                shape = parsed
+            }
             let pane: StatusPane?
             switch parsePane(request.args?.pane) {
             case .pane(let parsed): pane = parsed
@@ -332,6 +410,7 @@ public struct ControlDispatcher {
             let update = ControlSessionStatusUpdate(status: status, blink: request.args?.blink,
                                                     autoReset: request.args?.autoReset,
                                                     sound: request.args?.sound, color: request.args?.color,
+                                                    shape: shape,
                                                     pane: pane, paneID: request.args?.paneID)
             return actions.setSessionStatus(request.target, window: request.args?.window, update: update)
         case .sessionRestore:
@@ -344,9 +423,8 @@ public struct ControlDispatcher {
     /// `session.restore`: parse the `set`|`none`|`clear` mode into a `ControlRestoreOverride` and the pane
     /// selector into a `StatusPane`, then hand both to the host. A pinned command is validated but NEVER
     /// rewritten — it is a shell line, so metacharacters are the point; it is rejected only for being
-    /// absent, carrying control characters, or exceeding the storage cap. An EMPTY command is the same
-    /// pinned-to-nothing state as `none`. `paneID` rides through opaquely (the dispatcher has no session
-    /// to resolve it against).
+    /// absent, carrying control characters, or exceeding the storage cap. An EMPTY command means the same
+    /// pinned-to-nothing state as `none`. `paneID` rides through opaquely (no session here to resolve it).
     private func dispatchSessionRestore(_ request: ControlRequest) -> ControlResponse {
         let args = request.args
         let pin: ControlRestoreOverride
@@ -383,20 +461,34 @@ public struct ControlDispatcher {
     }
 
     /// The outcome of parsing a `--pane` selector: the pane (nil when the selector was absent), or the
-    /// rejection response the arm returns as-is.
-    private enum PaneSelection {
-        case pane(StatusPane?)
+    /// rejection response the arm returns as-is. Generic over the pane type, so the role selector and the
+    /// overlay selector differ only in which enum they parse into and which rejection they carry.
+    private enum PaneSelection<Pane> {
+        case pane(Pane?)
         case rejected(ControlResponse)
     }
 
-    /// The shared `--pane` role selector (`session.status`, `session.restore`): nil when absent, the parsed
-    /// pane when valid, and the pinned rejection when the token names no pane.
-    private func parsePane(_ raw: String?) -> PaneSelection {
+    /// The shared `--pane` selector: nil when absent, the parsed pane when `parse` accepts it, and `error`
+    /// as the pinned rejection otherwise. No live session needed either way.
+    private func parsePane<Pane>(_ raw: String?, error: String,
+                                 parse: (String) -> Pane?) -> PaneSelection<Pane> {
         guard let raw else { return .pane(nil) }
-        guard let parsed = StatusPane(rawValue: raw) else {
-            return .rejected(ControlResponse(ok: false, error: "--pane must be left, right, or scratch"))
-        }
+        guard let parsed = parse(raw) else { return .rejected(ControlResponse(ok: false, error: error)) }
         return .pane(parsed)
+    }
+
+    /// The role selector (`session.status`, `session.restore`). It accepts role and position aliases; the
+    /// stable rejection names the canonical `left|right|scratch` read-back values.
+    private func parsePane(_ raw: String?) -> PaneSelection<StatusPane> {
+        parsePane(raw, error: "--pane must be left, right, or scratch") { StatusPane(controlName: $0) }
+    }
+
+    /// The `session.overlay.*` selector (`.open`/`.close`/`.result`/`.copy`/`.text`): absent keeps the
+    /// session-wide overlay,
+    /// `left`/`right` (and their `primary`/`split` aliases) scope to one pane, `scratch` is rejected — there
+    /// being no scratch pane to cover.
+    private func parseOverlayPane(_ raw: String?) -> PaneSelection<OverlayPane> {
+        parsePane(raw, error: PaneOverlayError.invalidPane) { OverlayPane(controlName: $0) }
     }
 
     private func dispatchSessionMove(targets: [String], window: String?, move: ControlSessionMove) -> ControlResponse {
@@ -416,6 +508,11 @@ public struct ControlDispatcher {
                                            collapsed: request.args?.collapsed ?? false)
         case .workspaceSelect:
             return actions.selectWorkspace(request.target, window: request.args?.window)
+        case .workspaceGo:
+            guard let dir = (request.args?.to).flatMap(WorkspaceNavigation.init(wire:)) else {
+                return ControlResponse(ok: false, error: "workspace.go requires --to next|prev")
+            }
+            return actions.goWorkspace(window: request.args?.window, direction: dir)
         case .workspaceRename:
             guard let name = request.args?.name?.trimmedOrNil else {
                 return ControlResponse(ok: false, error: "workspace.rename requires a name")
@@ -432,7 +529,22 @@ public struct ControlDispatcher {
             }
             return actions.moveWorkspace(request.target, window: request.args?.window, direction: direction)
         case .workspaceFocus:
-            return actions.focusWorkspace(request.target, window: request.args?.window, mode: request.args?.mode)
+            // parsed + rejected BEFORE the host runs, so an unknown mode can never half-apply; the
+            // accepted list is derived from `allCases`, so it cannot go stale when a mode is added.
+            let raw = request.args?.mode ?? ControlWorkspaceFocusMode.toggle.rawValue
+            guard let mode = ControlWorkspaceFocusMode(rawValue: raw) else {
+                return ControlResponse(ok: false,
+                                       error: "invalid focus mode: \(raw) (\(ControlWorkspaceFocusMode.validNamesList))")
+            }
+            return actions.focusWorkspace(request.target, window: request.args?.window, mode: mode)
+        case .workspaceFilter:
+            // window-scoped: no workspace target, only the flag. Same on/off/toggle vocabulary and shared
+            // parser as `sidebar`, defaulting to `toggle`.
+            guard let mode = ControlToggleMode.parse(request.args?.mode) else {
+                return ControlResponse(ok: false,
+                                       error: "invalid workspace filter mode: \(request.args?.mode ?? "toggle")")
+            }
+            return actions.setWorkspaceFilter(window: request.args?.window, mode: mode)
         case .workspaceCollapse:
             return actions.setWorkspaceExpansion(request.target, window: request.args?.window, expanded: false)
         case .workspaceExpand:
@@ -445,7 +557,19 @@ public struct ControlDispatcher {
     private func dispatchSessionSurfaceCommand(_ request: ControlRequest) async -> ControlResponse {
         switch request.cmd {
         case .sessionSplit:
-            return actions.splitSession(request.target, window: request.args?.window, mode: request.args?.mode)
+            let axis: SplitAxis?
+            if let raw = request.args?.axis {
+                guard let parsed = SplitAxis(rawValue: raw) else {
+                    return ControlResponse(ok: false, error: "invalid split axis: \(raw) (vertical|horizontal)")
+                }
+                axis = parsed
+            } else {
+                axis = nil
+            }
+            return actions.splitSession(request.target, window: request.args?.window,
+                                        mode: request.args?.mode, axis: axis)
+        case .sessionSplitClose:
+            return actions.closeSessionSplit(request.target, window: request.args?.window)
         case .sessionScratch:
             return actions.scratchSession(request.target, window: request.args?.window, mode: request.args?.mode,
                                           command: request.args?.command)
@@ -467,6 +591,8 @@ public struct ControlDispatcher {
                 return ControlResponse(ok: false, error: "invalid surface zoom mode: \(request.args?.mode ?? "toggle")")
             }
             return actions.setSurfaceZoom(request.target, window: request.args?.window, mode: mode)
+        case .surfaceCursor:
+            return actions.readSurfaceCursor(request.target, window: request.args?.window)
         case .sessionType:
             guard let text = request.args?.text else {
                 return ControlResponse(ok: false, error: "session.type requires text")
@@ -493,6 +619,14 @@ public struct ControlDispatcher {
             if let color = request.args?.color, !WatermarkConfig.isValidColorHex(color) {
                 return ControlResponse(ok: false, error: "invalid color: \(color) (#rrggbb)")
             }
+            let pane: OverlayPane?
+            switch parseOverlayPane(request.args?.pane) {
+            case .rejected(let response): return response
+            case .pane(let parsed): pane = parsed
+            }
+            if pane != nil, request.args?.sizePercent != nil {
+                return ControlResponse(ok: false, error: PaneOverlayError.sizePercentConflict)
+            }
             return actions.openSessionOverlay(request.target, window: request.args?.window,
                                               options: ControlSessionOverlayOpenOptions(
                                                 command: command,
@@ -500,11 +634,20 @@ public struct ControlDispatcher {
                                                 wait: request.args?.wait ?? false,
                                                 sizePercent: request.args?.sizePercent,
                                                 backgroundColor: request.args?.color,
-                                                follow: request.args?.follow ?? false
+                                                follow: request.args?.follow ?? false,
+                                                pane: pane
                                               ))
         case .sessionOverlayClose:
-            return actions.closeSessionOverlay(request.target, window: request.args?.window)
+            switch parseOverlayPane(request.args?.pane) {
+            case .rejected(let response): return response
+            case .pane(let pane):
+                return actions.closeSessionOverlay(request.target, window: request.args?.window, pane: pane)
+            }
         case .sessionOverlayResize:
+            // pane overlays are always full, so ANY `--pane` is refused here, valid spelling or not.
+            if request.args?.pane != nil {
+                return ControlResponse(ok: false, error: PaneOverlayError.resizeUnsupported)
+            }
             let wantsFull = request.args?.full == true
             let percent = request.args?.sizePercent
             if wantsFull, percent != nil {
@@ -519,7 +662,19 @@ public struct ControlDispatcher {
             return actions.resizeSessionOverlay(request.target, window: request.args?.window,
                                                 sizePercent: wantsFull ? nil : percent)
         case .sessionOverlayResult:
-            return actions.sessionOverlayResult(request.target, window: request.args?.window)
+            switch parseOverlayPane(request.args?.pane) {
+            case .rejected(let response): return response
+            case .pane(let pane):
+                return actions.sessionOverlayResult(request.target, window: request.args?.window, pane: pane)
+            }
+        case .sessionOverlayCopy:
+            switch parseOverlayPane(request.args?.pane) {
+            case .rejected(let response): return response
+            case .pane(let pane):
+                return actions.copySessionOverlaySelection(request.target, window: request.args?.window, pane: pane)
+            }
+        case .sessionOverlayText:
+            return dispatchSessionOverlayText(request)
         case .sessionBackground:
             return dispatchSessionBackground(request)
         case .sessionText:
@@ -544,6 +699,8 @@ public struct ControlDispatcher {
             return actions.setQuickTerminal(mode: request.args?.mode)
         case .keymapReload:
             return actions.reloadKeymap()
+        case .keymapList:
+            return actions.listKeymap()
         case .configReload:
             return actions.reloadGhosttyConfig()
         case .notify:
@@ -578,8 +735,8 @@ public struct ControlDispatcher {
     }
 
     /// The quick-terminal input/read commands, `async` because the app side polls briefly for the surface
-    /// to mount + realize after `quick show` (the twin of `session.type`/`session.text`, which are async
-    /// for the same realize-wait reason).
+    /// to mount + realize after `quick show` — the same realize-wait that makes `session.type`/`session.text`
+    /// async.
     private func dispatchQuickCommand(_ request: ControlRequest) async -> ControlResponse {
         switch request.cmd {
         case .quickType:
@@ -662,25 +819,62 @@ public struct ControlDispatcher {
                                             options: ControlSessionBackgroundOptions(watermark: watermark))
     }
 
-    private func dispatchSessionText(_ request: ControlRequest) -> ControlResponse {
-        let all = request.args?.all ?? false
-        let lines = request.args?.lines
+    /// How much of a buffer a read covers, or the rejection its arm returns as-is. Shared by `session.text`
+    /// and `session.overlay.text` so the two cannot drift; an unchecked nonpositive `lines` would fall
+    /// through to the full buffer.
+    private enum BufferExtent {
+        case extent(all: Bool, lines: Int?)
+        case rejected(ControlResponse)
+    }
+
+    private func parseBufferExtent(_ args: ControlArgs?) -> BufferExtent {
+        let all = args?.all ?? false
+        let lines = args?.lines
         if all, lines != nil {
-            return ControlResponse(ok: false, error: "use either --all or --lines, not both")
+            return .rejected(ControlResponse(ok: false, error: "use either --all or --lines, not both"))
         }
         if let lines, lines <= 0 {
-            return ControlResponse(ok: false, error: "--lines must be greater than 0")
+            return .rejected(ControlResponse(ok: false, error: "--lines must be greater than 0"))
         }
-        return actions.readSessionText(request.target, window: request.args?.window,
-                                       options: ControlSessionTextOptions(pane: request.args?.pane,
-                                                                          all: all,
-                                                                          lines: lines))
+        return .extent(all: all, lines: lines)
+    }
+
+    private func dispatchSessionText(_ request: ControlRequest) -> ControlResponse {
+        switch parseBufferExtent(request.args) {
+        case .rejected(let response): return response
+        case .extent(let all, let lines):
+            return actions.readSessionText(request.target, window: request.args?.window,
+                                           options: ControlSessionTextOptions(pane: request.args?.pane,
+                                                                              all: all,
+                                                                              lines: lines))
+        }
+    }
+
+    /// The extent is checked before the pane, so the same flags produce the same first error here and on
+    /// `session.text`.
+    private func dispatchSessionOverlayText(_ request: ControlRequest) -> ControlResponse {
+        let all: Bool
+        let lines: Int?
+        switch parseBufferExtent(request.args) {
+        case .rejected(let response): return response
+        case .extent(let parsedAll, let parsedLines):
+            all = parsedAll
+            lines = parsedLines
+        }
+        switch parseOverlayPane(request.args?.pane) {
+        case .rejected(let response): return response
+        case .pane(let pane):
+            return actions.readSessionOverlayText(request.target, window: request.args?.window,
+                                                  options: ControlSessionOverlayTextOptions(pane: pane,
+                                                                                            all: all,
+                                                                                            lines: lines))
+        }
     }
 
     private func dispatchWindowCommand(_ request: ControlRequest) async -> ControlResponse {
         switch request.cmd {
         case .windowNew:
-            return actions.windowNew(name: request.args?.name)
+            return await actions.windowNew(name: request.args?.name, minimized: request.args?.minimized ?? false)
         case .windowList:
             return actions.windowList()
         case .windowSelect:
@@ -709,19 +903,26 @@ public struct ControlDispatcher {
             return actions.windowZoom(request.target)
         case .windowFullscreen:
             return actions.windowFullscreen(request.target)
+        case .windowMinimize:
+            guard let mode = ControlToggleMode.parse(request.args?.mode) else {
+                return ControlResponse(ok: false, error: "invalid window minimize mode: \(request.args?.mode ?? "toggle")")
+            }
+            return await actions.windowMinimize(request.target, mode: mode)
         default:
             preconditionFailure("unexpected window command: \(request.cmd.rawValue)")
         }
     }
 
-    /// The dashboard overlay is host-free-validated here. The open path needs at least one id (or `--mru`)
-    /// and at most one font flag; `--close` takes no id, `--mru`, or font flag; a `--font-size` must be
-    /// finite and positive; `--mru` cannot be combined with explicit ids (but composes with the font flags).
-    /// The 9-cell cap is NOT applied here: the cell unit is a session+pane, so a split session expands to two
-    /// cells and the cap counts PANES — that expansion needs the store, so it lives app-side in
-    /// `ControlServer.setDashboard`, which also reports any dropped panes. Target resolution (incl. the
-    /// `--mru` recency lookup), the pane expansion + cap, the surface reparent, and the per-window controller
-    /// all stay app-side behind `ControlActions.setDashboard`; this only forwards the raw ids.
+    /// The dashboard overlay is host-free-validated here: an open needs at least one id (or `--mru`) and at
+    /// most one font flag, `--close` takes no id/`--mru`/font flag, a `--font-size` must be finite and
+    /// positive, `--mru` cannot be combined with explicit ids (but composes with the font flags), and every
+    /// id parses as a `DashboardTarget` — a malformed pane suffix fails the whole command here, while a
+    /// well-formed ref naming no live pane is an app-side miss.
+    /// The 9-cell cap is NOT applied here — the cell unit is a session+pane, so a split session expands to
+    /// two cells and the cap counts PANES, which needs the store. That expansion + cap, the dropped-pane
+    /// report, target resolution (incl. the `--mru` recency lookup), the surface reparent, and the
+    /// per-window controller all live app-side behind `ControlActions.setDashboard`
+    /// (`ControlServer.setDashboard`); this forwards the ids as raw strings once their grammar is checked.
     private func dispatchDashboard(_ request: ControlRequest) -> ControlResponse {
         let args = request.args
         let targets = args?.targets ?? []
@@ -744,8 +945,6 @@ public struct ControlDispatcher {
         }
         let fontMode: DashboardFontMode = autoSize ? .auto : (fontSize.map(DashboardFontMode.fixed) ?? .untouched)
         if mru {
-            // --mru supplies the members app-side from the window's recency, so it takes no explicit ids; the
-            // font flags still apply.
             guard targets.isEmpty else {
                 return ControlResponse(ok: false, error: "dashboard --mru cannot be combined with explicit session ids")
             }
@@ -753,6 +952,13 @@ public struct ControlDispatcher {
         }
         guard !targets.isEmpty else {
             return ControlResponse(ok: false, error: "dashboard requires at least one session id")
+        }
+        // grammar only: a malformed pane suffix fails the command here, while a well-formed ref that
+        // resolves to nothing is app-side and joins the `unresolved` note instead.
+        if let malformed = targets.first(where: { DashboardTarget(rawValue: $0) == nil }) {
+            return ControlResponse(
+                ok: false,
+                error: "dashboard: invalid session id '\(malformed)' — use <id>, <id>:left, or <id>:right")
         }
         return actions.setDashboard(targets: targets, window: args?.window, close: false, fontMode: fontMode, mru: false)
     }

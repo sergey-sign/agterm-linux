@@ -9,16 +9,20 @@ if (( $# < 1 || $# > 2 )); then
 fi
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+VERIFY_ARCH="$ROOT/scripts/verify-linux-architecture.sh"
 VERSION="${1#v}"
 # nFPM's semver schema maps prerelease separators to '~' so prereleases sort before stable versions.
 PACKAGE_VERSION="${VERSION/-/~}"
 OUT="${2:-dist-linux}"
 [[ "$OUT" = /* ]] || OUT="$ROOT/$OUT"
 
-TAR="$OUT/agterm-linux-v${VERSION}-x86_64.tar.gz"
-DEB="$OUT/agterm-linux-v${VERSION}-x86_64.deb"
-RPM="$OUT/agterm-linux-v${VERSION}-x86_64.rpm"
-APPIMAGE="$OUT/agterm-v${VERSION}-x86_64.AppImage"
+# shellcheck source=../linux/arch.sh
+source "$ROOT/linux/arch.sh"
+
+TAR="$OUT/agterm-linux-v${VERSION}-${HOST_ARCH}.tar.gz"
+DEB="$OUT/agterm-linux-v${VERSION}-${HOST_ARCH}.deb"
+RPM="$OUT/agterm-linux-v${VERSION}-${HOST_ARCH}.rpm"
+APPIMAGE="$OUT/agterm-v${VERSION}-${HOST_ARCH}.AppImage"
 CHECKSUMS="$OUT/agterm-linux-v${VERSION}-SHA256SUMS"
 
 for artifact in "$TAR" "$DEB" "$RPM" "$APPIMAGE" "$CHECKSUMS"; do
@@ -42,22 +46,31 @@ verify_pi_extension() {
   grep -Fq 'report(["completed", "--auto-reset"])' "$extension"
 }
 
+verify_opencode_plugin() {
+  local plugin="$1"
+  test -f "$plugin"
+  grep -Fq '// agterm-opencode-status-plugin' "$plugin"
+  grep -Fq 'export const AgtermStatusPlugin' "$plugin"
+}
+
 verify_payload() {
   local payload="$1"
   test -x "$payload/bin/agterm-linux"
   test -x "$payload/bin/agterm-linux.bin"
   test -x "$payload/bin/agtermctl"
   test -x "$payload/bin/agtermctl.bin"
+  test -r "$payload/bin/agterm-linux_AgtermLinux.resources/hud/hud.sh"
   test -f "$payload/lib/libghostty.so"
   "$ROOT/scripts/verify-linux-resources.sh" "$payload/share"
   test -x "$payload/share/agterm/agent-status/agterm-agent-status.sh"
   test -x "$payload/share/agterm/agent-status/agterm-codex-status.sh"
   verify_pi_extension "$payload/share/agterm/agent-status/pi/agterm-status.ts"
+  verify_opencode_plugin "$payload/share/agterm/agent-status/opencode/agterm-status.js"
   test -f "$payload/share/agterm/agent-skill/SKILL.md"
   [[ "$(<"$payload/share/agterm/VERSION")" == "$VERSION" ]]
   test -f "$payload/share/applications/io.github.melonamin.agterm.desktop"
   desktop-file-validate "$payload/share/applications/io.github.melonamin.agterm.desktop"
-  file "$payload/bin/agterm-linux.bin" | grep -q 'x86-64'
+  "$VERIFY_ARCH" "$payload/bin/agterm-linux.bin"
   for binary in agterm-linux.bin agtermctl.bin; do
     LD_LIBRARY_PATH="$payload/lib" ldd "$payload/bin/$binary" > "$WORK/$binary.ldd"
     if grep -q 'not found' "$WORK/$binary.ldd"; then
@@ -74,7 +87,7 @@ tar -xzf "$TAR" -C "$WORK/tar"
 verify_payload "$WORK/tar/agterm-linux"
 
 [[ "$(dpkg-deb -f "$DEB" Package)" == 'agterm-linux' ]]
-[[ "$(dpkg-deb -f "$DEB" Architecture)" == 'amd64' ]]
+[[ "$(dpkg-deb -f "$DEB" Architecture)" == "$PACKAGE_ARCH" ]]
 [[ "$(dpkg-deb -f "$DEB" Version)" == "$PACKAGE_VERSION-1" ]]
 dpkg-deb -x "$DEB" "$WORK/deb"
 verify_payload "$WORK/deb/opt/agterm-linux"
@@ -82,7 +95,7 @@ verify_payload "$WORK/deb/opt/agterm-linux"
 [[ "$(readlink "$WORK/deb/usr/bin/agtermctl")" == '/opt/agterm-linux/bin/agtermctl' ]]
 
 [[ "$(rpm -qp --queryformat '%{NAME}' "$RPM")" == 'agterm-linux' ]]
-[[ "$(rpm -qp --queryformat '%{ARCH}' "$RPM")" == 'x86_64' ]]
+[[ "$(rpm -qp --queryformat '%{ARCH}' "$RPM")" == "$HOST_ARCH" ]]
 [[ "$(rpm -qp --queryformat '%{VERSION}-%{RELEASE}' "$RPM")" == "$PACKAGE_VERSION-1" ]]
 (
   cd "$WORK/rpm"
@@ -98,7 +111,7 @@ verify_payload "$WORK/rpm/opt/agterm-linux"
 [[ "$(readlink "$WORK/rpm/usr/bin/agterm-linux")" == '/opt/agterm-linux/bin/agterm-linux' ]]
 [[ "$(readlink "$WORK/rpm/usr/bin/agtermctl")" == '/opt/agterm-linux/bin/agtermctl' ]]
 
-file "$APPIMAGE" | grep -q 'ELF 64-bit'
+"$VERIFY_ARCH" "$APPIMAGE"
 (
   cd "$WORK/appimage"
   "$APPIMAGE" --appimage-extract >/dev/null
@@ -108,9 +121,12 @@ test -x "$APPROOT/AppRun"
 test -x "$APPROOT/usr/bin/agterm-linux.bin"
 test -x "$APPROOT/usr/bin/agtermctl"
 test -x "$APPROOT/usr/bin/agtermctl.bin"
+"$VERIFY_ARCH" "$APPROOT/usr/bin/agterm-linux.bin"
+test -r "$APPROOT/usr/bin/agterm-linux_AgtermLinux.resources/hud/hud.sh"
 test -x "$APPROOT/usr/share/agterm/agent-status/agterm-agent-status.sh"
 test -x "$APPROOT/usr/share/agterm/agent-status/agterm-codex-status.sh"
 verify_pi_extension "$APPROOT/usr/share/agterm/agent-status/pi/agterm-status.ts"
+verify_opencode_plugin "$APPROOT/usr/share/agterm/agent-status/opencode/agterm-status.js"
 test -f "$APPROOT/usr/share/agterm/agent-skill/SKILL.md"
 [[ "$(<"$APPROOT/usr/share/agterm/VERSION")" == "$VERSION" ]]
 find "$APPROOT/usr/lib" -name 'libgtk-4.so.1' -print -quit | grep -q .

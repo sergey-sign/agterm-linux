@@ -40,8 +40,7 @@ final class SessionSubtitleUITests: XCTestCase {
 
         emitOscTitle("REMOTE-DEMO-TITLE")
 
-        // the palette list is snapshotted on open, so reopen until the OSC title has landed; capture the
-        // value that satisfied it for the negative assertion.
+        // the palette list is snapshotted on open, so reopen until the OSC title has landed.
         var subtitle = ""
         XCTAssertTrue(poll(timeout: 10) {
             subtitle = self.currentPaletteSubtitle()
@@ -50,15 +49,13 @@ final class SessionSubtitleUITests: XCTestCase {
         }, "a named session's second line should show the OSC title; got \(subtitle)")
         XCTAssertFalse(subtitle.contains(cwdMarker), "the second line should drop the stale local path; got \(subtitle)")
 
-        // line 1 stays the custom name — the title only ever changes the second line.
         XCTAssertTrue(rowValueEquals("session-row", "demo-host"), "the OSC title must not override the custom name")
     }
 
     func testUnnamedSessionKeepsCwdOnSecondLine() throws {
         emitOscTitle("UNNAMED-DEMO-TITLE")
 
-        // unnamed → the OSC title drives the sidebar label (line 1); waiting on this also confirms the
-        // title has been captured before the palette is opened.
+        // waiting on line 1 also confirms the title was captured before the palette is opened.
         XCTAssertTrue(rowValueEquals("session-row", "UNNAMED-DEMO-TITLE", timeout: 10),
                       "an unnamed session's line 1 should become the OSC title")
 
@@ -94,9 +91,15 @@ final class SessionSubtitleUITests: XCTestCase {
         let item = app.menuItems["Go to Session"]
         guard item.waitForExistence(timeout: 5) else { return "" }
         item.click()
-        let subtitle = app.staticTexts["palette-subtitle"].firstMatch
-        guard subtitle.waitForExistence(timeout: 5) else { return "" }
-        return subtitle.value as? String ?? ""
+        let rows = app.descendants(matching: .staticText)
+            .matching(NSPredicate(format: "identifier BEGINSWITH 'palette-item-'"))
+        guard rows.firstMatch.waitForExistence(timeout: 5) else { return "" }
+        // #316 put `palette-item-<id>` on the row container and SwiftUI propagates a container identifier
+        // onto its descendant Texts, so the subtitle stopped answering to `palette-subtitle`. It is still
+        // the only row text carrying the `workspace · detail` separator, which is what finds it now.
+        return rows.allElementsBoundByIndex
+            .compactMap { $0.value as? String }
+            .first { $0.contains(" · ") } ?? ""
     }
 
     private func closePalette() {

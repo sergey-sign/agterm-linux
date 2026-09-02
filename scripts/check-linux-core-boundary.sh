@@ -4,7 +4,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-BASE="${1:-v0.15.2}"
+BASE="${1:-v0.24.0}"
 CORE="$ROOT/agtermCore/Sources/agtermCore"
 PROTECTED_TEST="agtermCore/Tests/agtermCoreTests/ConfigPathsTests.swift"
 
